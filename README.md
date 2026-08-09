@@ -25,3 +25,9 @@ pnpm build
 ## 部署原则
 
 本项目将使用独立项目目录、运行用户、端口、进程、数据库与环境变量，通过单独的域名反向代理对外提供服务，避免影响服务器上其他项目。
+
+- 项目目录：`/home/ubuntu/s-pm`
+- 数据目录：`/home/ubuntu/s-pm-data`
+- 本机端口：`127.0.0.1:3108`
+- PM2 进程：`s-pm-web`
+- SQLite 数据库：`/home/ubuntu/s-pm-data/s-pm.sqlite`
