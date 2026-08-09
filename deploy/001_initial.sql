@@ -84,6 +84,14 @@ CREATE TABLE IF NOT EXISTS attachments (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  schedule_reminders INTEGER NOT NULL DEFAULT 1,
+  project_updates INTEGER NOT NULL DEFAULT 1,
+  weekly_digest INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
 CREATE INDEX IF NOT EXISTS idx_projects_region ON projects(region);
 CREATE INDEX IF NOT EXISTS idx_contacts_region ON contacts(region);

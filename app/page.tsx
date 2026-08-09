@@ -4,6 +4,10 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Section = "dashboard" | "projects" | "people" | "settings";
 type CalendarMode = "日" | "周" | "月" | "年";
+type SettingsTab = "profile" | "security" | "notifications" | "storage";
+type Profile = { displayName: string; username: string; email?: string | null };
+type Preferences = { scheduleReminders: boolean; projectUpdates: boolean; weeklyDigest: boolean };
+type StorageInfo = { provider: string; configured: boolean; bucket?: string | null; region?: string | null };
 
 const projects = [
   { id: "p1", name: "湖畔新生·品牌升级", client: "美湖文旅", status: "进行中", color: "#ff6b57", region: "杭州", date: "08.02—11.18" },
@@ -47,6 +51,11 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [toast, setToast] = useState("");
+  const [profile, setProfile] = useState<Profile>({ displayName: "汪诺", username: "汪诺", email: "" });
+  const [preferences, setPreferences] = useState<Preferences>({ scheduleReminders: true, projectUpdates: true, weeklyDigest: true });
+  const [storage, setStorage] = useState<StorageInfo>({ provider: "腾讯云 COS", configured: false });
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("profile");
+  const [calendarDate, setCalendarDate] = useState(() => new Date());
 
   const searchResults = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -54,8 +63,9 @@ export default function Home() {
     return [
       ...projectItems.filter(p => `${p.name}${p.client}${p.region}`.toLowerCase().includes(q)).map(p => ({ ...p, type: "项目" })),
       ...peopleItems.filter(p => `${p.name}${p.company}${p.role}`.toLowerCase().includes(q)).map(p => ({ ...p, type: "联系人" })),
+      ...eventItems.filter((event: any) => `${event.title}${event.place || ""}${event.description || ""}`.toLowerCase().includes(q)).map((event: any) => ({ ...event, name: event.title, type: "日程" })),
     ].slice(0, 6);
-  }, [query, projectItems, peopleItems]);
+  }, [query, projectItems, peopleItems, eventItems]);
 
   useEffect(() => {
     fetch("/api/session", { credentials: "include" }).then(response => {
@@ -72,6 +82,9 @@ export default function Home() {
     setProjectItems(data.projects || []);
     setPeopleItems(data.people || []);
     setEventItems(data.events || []);
+    if (data.profile) setProfile(data.profile);
+    if (data.preferences) setPreferences(data.preferences);
+    if (data.storage) setStorage(data.storage);
   }
 
   async function login(e: FormEvent<HTMLFormElement>) {
@@ -88,7 +101,7 @@ export default function Home() {
     }
   }
 
-  async function saveModal(e: FormEvent<HTMLFormElement>) {
+  async function saveModal(e: FormEvent<HTMLFormElement>, files: File[] = []) {
     e.preventDefault();
     if (!modal) return;
     const form = new FormData(e.currentTarget);
@@ -101,12 +114,37 @@ export default function Home() {
       window.setTimeout(() => setToast(""), 3000);
       return;
     }
+    const saved = await response.json();
+    if (modal === "event" && files.length) {
+      for (const file of files) {
+        const upload = await fetch(`/api/schedules/${saved.id}/attachments?name=${encodeURIComponent(file.name)}`, { method: "POST", credentials: "include", headers: { "content-type": file.type || "application/octet-stream" }, body: file });
+        if (!upload.ok) {
+          const data = await upload.json().catch(() => ({}));
+          setToast(`日程已保存，但附件上传失败：${data.error || file.name}`);
+          window.setTimeout(() => setToast(""), 4500);
+          await loadData();
+          setModal(null);
+          return;
+        }
+      }
+    }
     const labels = { project: "项目", person: "人员", event: "日程" };
     await loadData();
     setToast(`${labels[modal]}已保存`);
     setModal(null);
     window.setTimeout(() => setToast(""), 2400);
   }
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setSearchOpen(true); }
+      if (event.key === "Escape") { setSearchOpen(false); setModal(null); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(""), 2600); };
 
   if (!authReady) return <main className="login-page"><section className="login-story"></section><section className="login-form-wrap"><div className="login-form"><p className="login-kicker">澄序</p><h2>正在打开工作台…</h2></div></section></main>;
   if (!loggedIn) return <Login onSubmit={login} error={loginError} />;
@@ -158,11 +196,11 @@ export default function Home() {
       <section className="workspace">
         <header className="topbar">
           <button className="search" onClick={() => setSearchOpen(true)} aria-label="打开搜索"><span>⌕</span><span>搜索项目、人员或日程</span><kbd>⌘ K</kbd></button>
-          <div className="top-actions"><button className="icon-button" aria-label="帮助">?</button><button className="icon-button notification" aria-label="通知">◌</button></div>
+          <div className="top-actions"><button className="icon-button" aria-label="帮助" onClick={() => notify("可用 ⌘K 搜索；项目和人员页可筛选关联日程")}>?</button><button className="icon-button notification" aria-label="通知" onClick={() => { goSection("settings"); setSettingsTab("notifications"); }}><span className="notification">◌</span></button></div>
         </header>
 
         <div className="content">
-          {section === "dashboard" && <Dashboard onNavigate={goSection} projects={projectItems} people={peopleItems} events={eventItems} />}
+          {section === "dashboard" && <Dashboard onNavigate={goSection} onCalendar={() => { goSection("projects"); setSelectedProject(null); }} projects={projectItems} people={peopleItems} events={eventItems} />}
           {(section === "projects" || section === "people") && (
             <CalendarPage
               title={calendarTitle || "全部日程"}
@@ -171,16 +209,19 @@ export default function Home() {
               onMode={setMode}
               events={filteredEvents}
               onCreate={() => setModal("event")}
+              date={calendarDate}
+              onDate={setCalendarDate}
             />
           )}
-          {section === "settings" && <Settings />}
+          {section === "settings" && <Settings tab={settingsTab} onTab={setSettingsTab} profile={profile} preferences={preferences} storage={storage} counts={{ projects: projectItems.length, people: peopleItems.length, events: eventItems.length }} onSaved={async message => { await loadData(); notify(message); }} />}
         </div>
       </section>
 
       {modal && <Modal type={modal} onClose={() => setModal(null)} onSave={saveModal} projects={projectItems} people={peopleItems} />}
-      {searchOpen && <SearchOverlay query={query} setQuery={setQuery} results={searchResults} onClose={() => { setSearchOpen(false); setQuery(""); }} onChoose={(item: any) => {
+      {searchOpen && <SearchOverlay query={query} setQuery={setQuery} results={searchResults} onClose={() => { setSearchOpen(false); setQuery(""); }} onWeek={() => { setSection("projects"); setSelectedProject(null); setMode("周"); setCalendarDate(new Date()); setSearchOpen(false); }} onOngoing={() => { setSection("projects"); setSelectedProject(projectItems.find(p => p.status === "进行中")?.id || null); setSearchOpen(false); }} onChoose={(item: any) => {
         if (item.type === "项目") { setSection("projects"); setSelectedProject(item.id); }
-        else { setSection("people"); setSelectedPerson(item.id); }
+        else if (item.type === "联系人") { setSection("people"); setSelectedPerson(item.id); }
+        else { setSection("projects"); setSelectedProject(item.project || null); setCalendarDate(new Date(item.startsAt)); }
         setSearchOpen(false); setQuery("");
       }} />}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
@@ -201,7 +242,7 @@ function Login({ onSubmit, error }: { onSubmit: (e: FormEvent<HTMLFormElement>) 
         <p className="login-kicker">欢迎回来</p><h2>登录澄序</h2><p className="login-hint">继续管理你的项目与合作网络</p>
         <label>账号<input name="username" placeholder="请输入账号" defaultValue="汪诺" autoFocus /></label>
         <label>密码<input name="password" type="password" placeholder="请输入密码" /></label>
-        <div className="login-options"><label><input type="checkbox" defaultChecked /> 记住我</label><button type="button">忘记密码？</button></div>
+        <div className="login-options"><label><input type="checkbox" defaultChecked /> 记住我</label><button type="button" onClick={() => window.alert("这是个人工作台，请联系系统管理员重置密码。")}>忘记密码？</button></div>
         {error && <p className="login-error">{error}</p>}
         <button className="login-submit" type="submit">登录 <span>→</span></button>
         <p className="demo-note">账号由项目所有人管理</p>
@@ -211,18 +252,21 @@ function Login({ onSubmit, error }: { onSubmit: (e: FormEvent<HTMLFormElement>) 
 }
 
 function SecondaryPanel({ type, selected, onSelect, onCreate, projects, people }: { type: "projects" | "people"; selected: string | null; onSelect: (id: string | null) => void; onCreate: () => void; projects: typeof globalThisProjects; people: typeof globalThisPeople }) {
-  const list = type === "projects" ? projects : people;
+  const [filter, setFilter] = useState("");
+  const source = type === "projects" ? projects : people;
+  const q = filter.trim().toLowerCase();
+  const list = q ? source.filter((item: any) => `${item.name}${item.client || ""}${item.company || ""}${item.region || ""}${item.status || ""}`.toLowerCase().includes(q)) : source;
   return <aside className="secondary">
-    <div className="secondary-head"><div><span>{type === "projects" ? "项目列表" : "联系人"}</span><strong>{list.length}</strong></div><button onClick={onCreate}>+　{type === "projects" ? "新建项目" : "新建人员"}</button></div>
-    <div className="secondary-filter"><span>⌕</span><input placeholder={type === "projects" ? "筛选项目" : "筛选人员"} /></div>
+    <div className="secondary-head"><div><span>{type === "projects" ? "项目列表" : "联系人"}</span><strong>{source.length}</strong></div><button onClick={onCreate}>+　{type === "projects" ? "新建项目" : "新建人员"}</button></div>
+    <div className="secondary-filter"><span>⌕</span><input value={filter} onChange={e => setFilter(e.target.value)} placeholder={type === "projects" ? "筛选项目" : "筛选人员"} /></div>
     <div className="secondary-list">
       <button className={`list-all ${!selected ? "active" : ""}`} onClick={() => onSelect(null)}><span className="all-icon">⋮</span><div><strong>全部日程</strong><small>查看所有安排</small></div></button>
       {list.map((item: any) => <button key={item.id} className={selected === item.id ? "active" : ""} onClick={() => onSelect(item.id)}>
         {type === "projects" ? <span className="project-dot" style={{ background: item.color }}></span> : <span className={`person-avatar ${item.tone}`}>{item.name.slice(-1)}</span>}
         <div><strong>{item.name}</strong><small>{type === "projects" ? `${item.status} · ${item.date}` : `${item.company} · ${item.role}`}</small></div><span className="chevron">›</span>
       </button>)}
+      {list.length === 0 && <div className="empty-secondary">没有匹配结果</div>}
     </div>
-    <div className="secondary-foot"><span>◌</span><p><strong>今日还有 3 项安排</strong><small>下一项 14:00 开始</small></p></div>
   </aside>;
 }
 
@@ -230,7 +274,7 @@ const globalThisProjects = projects;
 const globalThisPeople = people;
 const globalThisEvents = events;
 
-function Dashboard({ onNavigate, projects, people, events }: { onNavigate: (s: Section) => void; projects: typeof globalThisProjects; people: typeof globalThisPeople; events: typeof globalThisEvents }) {
+function Dashboard({ onNavigate, onCalendar, projects, people, events }: { onNavigate: (s: Section) => void; onCalendar: () => void; projects: typeof globalThisProjects; people: typeof globalThisPeople; events: typeof globalThisEvents }) {
   const ongoing = projects.filter(p => p.status === "进行中").length;
   const proposal = projects.filter(p => p.status === "提案中").length;
   const done = projects.filter(p => p.status === "已完成").length;
@@ -243,59 +287,96 @@ function Dashboard({ onNavigate, projects, people, events }: { onNavigate: (s: S
   };
   const projectRegions = regionRows(projects);
   const peopleRegions = regionRows(people);
+  const upcoming = [...events].filter((event: any) => new Date(event.endsAt).getTime() >= Date.now()).sort((a: any, b: any) => new Date(a.startsAt).getTime() - new Date(b.startsAt).getTime()).slice(0, 3);
+  const now = new Date();
+  const dateText = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", day: "numeric", weekday: "long" }).format(now);
   return <div className="dashboard">
-    <div className="page-title"><div><p>2026 年 8 月 9 日，星期日</p><h1>上午好，汪诺 <span>✦</span></h1><p>这是你的工作全景，今天也一起有序推进。</p></div><button className="primary" onClick={() => onNavigate("projects")}>+　记录新项目</button></div>
+    <div className="page-title"><div><p>{dateText}</p><h1>{now.getHours() < 12 ? "上午好" : now.getHours() < 18 ? "下午好" : "晚上好"}，汪诺 <span>✦</span></h1><p>这是你的工作全景，今天也一起有序推进。</p></div><button className="primary" onClick={() => onNavigate("projects")}>+　记录新项目</button></div>
     <div className="metrics-grid">
       <Metric icon="□" label="项目总数" value={String(projects.length)} note="服务器实时数据" tone="coral" onClick={() => onNavigate("projects")} />
       <Metric icon="○" label="联系人总数" value={String(people.length)} note="服务器实时数据" tone="violet" onClick={() => onNavigate("people")} />
       <div className="metric-card status-card"><div className="metric-head"><span>项目状态</span><i>全部项目</i></div><div className="status-values"><div><strong>{ongoing}</strong><span><i className="dot ongoing"></i>进行中</span></div><div><strong>{proposal}</strong><span><i className="dot proposal"></i>提案中</span></div><div><strong>{done}</strong><span><i className="dot done"></i>已完成</span></div></div><div className="status-bar"><i></i><i></i><i></i></div></div>
     </div>
     <div className="dashboard-grid">
-      <section className="panel cooperation"><PanelTitle title="合作最多的联系人" subtitle="按参与项目数量" action="查看全部" />
+      <section className="panel cooperation"><PanelTitle title="合作最多的联系人" subtitle="按参与项目数量" action="查看全部" onAction={() => onNavigate("people")} />
         <div className="ranking-list">{people.slice(0, 4).map((p, i) => <div key={p.id}><span className={`rank r${i + 1}`}>{i + 1}</span><span className={`person-avatar ${p.tone}`}>{p.name.slice(-1)}</span><p><strong>{p.name}</strong><small>{p.company} · {p.role}</small></p><div className="rank-bar"><i style={{ width: `${100 - i * 16}%` }}></i></div><b>{p.count}<small>次</small></b></div>)}</div>
       </section>
-      <section className="panel schedule"><PanelTitle title="近期日程" subtitle="未来 7 天" action="查看日历" />
-        <div className="schedule-list"><div><time><strong>10</strong><span>8月 周一</span></time><i className="timeline coral"></i><p><strong>品牌内容工作坊</strong><span>09:30—11:30 · 美湖文旅</span></p><em>进行中</em></div><div><time><strong>12</strong><span>8月 周三</span></time><i className="timeline violet"></i><p><strong>视觉提案内审</strong><span>14:00—15:30 · MORI Studio</span></p><em>待开始</em></div><div><time><strong>13</strong><span>8月 周四</span></time><i className="timeline gold"></i><p><strong>展厅动线沟通</strong><span>10:30—12:30 · NOVA 科技</span></p><em>待开始</em></div></div>
+      <section className="panel schedule"><PanelTitle title="近期日程" subtitle="即将开始" action="查看日历" onAction={onCalendar} />
+        <div className="schedule-list">{upcoming.length ? upcoming.map((event: any) => { const start = new Date(event.startsAt); return <div key={event.id}><time><strong>{start.getDate()}</strong><span>{start.getMonth() + 1}月 周{["日","一","二","三","四","五","六"][start.getDay()]}</span></time><i className={`timeline ${event.color}`}></i><p><strong>{event.title}</strong><span>{event.time} · {event.place || "未填写地点"}</span></p><em>待开始</em></div>; }) : <div className="empty-schedule">暂无即将开始的日程</div>}</div>
       </section>
-      <RegionPanel title="项目地区分布" total={`${projects.length} 个项目`} data={projectRegions} tone="coral" />
-      <RegionPanel title="联系人地区分布" total={`${people.length} 位联系人`} data={peopleRegions} tone="violet" />
+      <RegionPanel title="项目地区分布" total={`${projects.length} 个项目`} data={projectRegions} tone="coral" onAction={() => onNavigate("projects")} />
+      <RegionPanel title="联系人地区分布" total={`${people.length} 位联系人`} data={peopleRegions} tone="violet" onAction={() => onNavigate("people")} />
     </div>
   </div>;
 }
 
 function Metric({ icon, label, value, note, tone, onClick }: any) { return <button className={`metric-card simple ${tone}`} onClick={onClick}><span className="metric-icon">{icon}</span><p>{label}<strong>{value}</strong></p><span className="trend">↗</span><small>{note}</small></button>; }
-function PanelTitle({ title, subtitle, action }: { title: string; subtitle: string; action: string }) { return <div className="panel-title"><div><h3>{title}</h3><p>{subtitle}</p></div><button>{action} ›</button></div>; }
-function RegionPanel({ title, total, data, tone }: { title: string; total: string; data: (string | number)[][]; tone: string }) { return <section className={`panel region ${tone}`}><PanelTitle title={title} subtitle={total} action="详情" /><div className="region-body"><div className="donut"><div><strong>{data.length}</strong><span>覆盖城市</span></div></div><div className="region-bars">{data.length ? data.map((r, i) => <div key={String(r[0])}><b>{i + 1}</b><span>{r[0]}</span><i><em style={{ width: `${r[2]}%` }}></em></i><strong>{r[1]}</strong></div>) : <div><span>暂无地区数据</span></div>}</div></div></section>; }
+function PanelTitle({ title, subtitle, action, onAction }: { title: string; subtitle: string; action: string; onAction?: () => void }) { return <div className="panel-title"><div><h3>{title}</h3><p>{subtitle}</p></div><button onClick={onAction}>{action} ›</button></div>; }
+function RegionPanel({ title, total, data, tone, onAction }: { title: string; total: string; data: (string | number)[][]; tone: string; onAction: () => void }) { return <section className={`panel region ${tone}`}><PanelTitle title={title} subtitle={total} action="详情" onAction={onAction} /><div className="region-body"><div className="donut"><div><strong>{data.length}</strong><span>覆盖城市</span></div></div><div className="region-bars">{data.length ? data.map((r, i) => <div key={String(r[0])}><b>{i + 1}</b><span>{r[0]}</span><i><em style={{ width: `${r[2]}%` }}></em></i><strong>{r[1]}</strong></div>) : <div><span>暂无地区数据</span></div>}</div></div></section>; }
 
-function CalendarPage({ title, subtitle, mode, onMode, events: filtered, onCreate }: { title: string; subtitle: string; mode: CalendarMode; onMode: (m: CalendarMode) => void; events: typeof events; onCreate: () => void }) {
+function addDate(date: Date, amount: number, unit: "day" | "week" | "month" | "year") {
+  const next = new Date(date);
+  if (unit === "day") next.setDate(next.getDate() + amount);
+  if (unit === "week") next.setDate(next.getDate() + amount * 7);
+  if (unit === "month") next.setMonth(next.getMonth() + amount);
+  if (unit === "year") next.setFullYear(next.getFullYear() + amount);
+  return next;
+}
+function dateKey(value: Date | string) { const date = value instanceof Date ? value : new Date(value); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`; }
+function mondayOf(date: Date) { const value = new Date(date); const day = value.getDay() || 7; value.setDate(value.getDate() - day + 1); value.setHours(0, 0, 0, 0); return value; }
+
+function CalendarPage({ title, subtitle, mode, onMode, events: filtered, onCreate, date, onDate }: { title: string; subtitle: string; mode: CalendarMode; onMode: (m: CalendarMode) => void; events: typeof events; onCreate: () => void; date: Date; onDate: (d: Date) => void }) {
+  const unit = mode === "日" ? "day" : mode === "周" ? "week" : mode === "月" ? "month" : "year";
+  const heading = mode === "年" ? `${date.getFullYear()} 年` : `${date.getFullYear()} 年 ${date.getMonth() + 1} 月`;
   return <div className="calendar-page">
-    <div className="calendar-heading"><div><p>{subtitle}</p><h1>{title}</h1><span>{filtered.length} 项安排·本周</span></div><button className="primary" onClick={onCreate}>+　新建日程</button></div>
+    <div className="calendar-heading"><div><p>{subtitle}</p><h1>{title}</h1><span>{filtered.length} 项安排</span></div><button className="primary" onClick={onCreate}>+　新建日程</button></div>
     <section className="calendar-card">
-      <div className="calendar-tools"><div className="date-nav"><button>‹</button><button>›</button><h2>2026 年 8 月 <span>第 33 周</span></h2><button className="today">今天</button></div><div className="view-switch">{(["日", "周", "月", "年"] as CalendarMode[]).map(m => <button key={m} className={mode === m ? "active" : ""} onClick={() => onMode(m)}>{m}</button>)}</div></div>
-      {mode === "周" && <WeekView events={filtered} />}
-      {mode === "日" && <DayView events={filtered} />}
-      {mode === "月" && <MonthView events={filtered} />}
-      {mode === "年" && <YearView events={filtered} />}
+      <div className="calendar-tools"><div className="date-nav"><button aria-label="上一段时间" onClick={() => onDate(addDate(date, -1, unit))}>‹</button><button aria-label="下一段时间" onClick={() => onDate(addDate(date, 1, unit))}>›</button><h2>{heading}</h2><button className="today" onClick={() => onDate(new Date())}>今天</button></div><div className="view-switch">{(["日", "周", "月", "年"] as CalendarMode[]).map(m => <button key={m} className={mode === m ? "active" : ""} onClick={() => onMode(m)}>{m}</button>)}</div></div>
+      {mode === "周" && <WeekView events={filtered} date={date} />}
+      {mode === "日" && <DayView events={filtered} date={date} />}
+      {mode === "月" && <MonthView events={filtered} date={date} />}
+      {mode === "年" && <YearView events={filtered} date={date} />}
     </section>
   </div>;
 }
 
 const times = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00"];
-function WeekView({ events: visible }: { events: typeof events }) { const days = [[10, "一"], [11, "二"], [12, "三"], [13, "四"], [14, "五"], [15, "六"], [16, "日"]]; return <div className="week-view"><div className="week-head"><span></span>{days.map(([d, w]) => <div className={d === 11 ? "today-col" : ""} key={d}><span>周{w}</span><strong>{d}</strong></div>)}</div><div className="week-body"><div className="time-col">{times.map(t => <span key={t}>{t}</span>)}</div>{days.map(([d]) => <div className={`day-col ${d === 11 ? "today-col" : ""}`} key={d}>{times.map(t => <i key={t}></i>)}{visible.filter(e => e.day === d).map(e => <article key={e.id} className={`calendar-event ${e.color}`} style={{ top: `${((parseInt(e.time) - 9) * 60 + parseInt(e.time.slice(3))) * 1.15 + 6}px`, height: `${e.duration * 60 * 1.15 - 4}px` }}><strong>{e.title}</strong><span>{e.time}</span><small>{e.place}</small></article>)}</div>)}</div></div>; }
-function DayView({ events: visible }: { events: typeof events }) { return <div className="day-view"><div className="day-heading"><div><span>星期二</span><strong>11</strong></div><p><strong>今日专注</strong><span>{visible.filter(e => e.day === 11).length || 0} 项日程</span></p></div><div className="day-schedule">{times.map(t => <div key={t}><span>{t}</span><i></i>{visible.filter(e => e.day === 11 && e.time.startsWith(t.slice(0, 2))).map(e => <article key={e.id} className={`calendar-event ${e.color}`}><strong>{e.title}</strong><span>{e.time} · {e.place}</span></article>)}</div>)}</div></div>; }
-function MonthView({ events: visible }: { events: typeof events }) { return <div className="month-view"><div className="month-weekdays">{["一", "二", "三", "四", "五", "六", "日"].map(d => <span key={d}>周{d}</span>)}</div><div className="month-grid">{Array.from({ length: 35 }, (_, i) => { const day = i - 2; return <div key={i} className={day === 11 ? "today-cell" : day < 1 || day > 31 ? "muted" : ""}><strong>{day < 1 ? 31 + day : day > 31 ? day - 31 : day}</strong>{visible.filter(e => e.day === day).map(e => <span className={e.color} key={e.id}>{e.title}</span>)}</div>; })}</div></div>; }
-function YearView({ events: visible }: { events: typeof events }) { return <div className="year-view">{Array.from({ length: 12 }, (_, month) => <div className={month === 7 ? "current-month" : ""} key={month}><h3>{month + 1} 月</h3><div className="mini-week">{["一", "二", "三", "四", "五", "六", "日"].map(d => <span key={d}>{d}</span>)}</div><div className="mini-days">{Array.from({ length: 35 }, (_, i) => <i key={i} className={month === 7 && visible.some(e => e.day === i - 1) ? "has-event" : month === 7 && i - 1 === 11 ? "today" : ""}>{i < 2 ? "" : i - 1 > 31 ? "" : i - 1}</i>)}</div></div>)}</div>; }
+function WeekView({ events: visible, date }: { events: typeof events; date: Date }) { const monday = mondayOf(date); const days = Array.from({ length: 7 }, (_, i) => addDate(monday, i, "day")); const today = dateKey(new Date()); return <div className="week-view"><div className="week-head"><span></span>{days.map((day, i) => <div className={dateKey(day) === today ? "today-col" : ""} key={dateKey(day)}><span>周{["一","二","三","四","五","六","日"][i]}</span><strong>{day.getDate()}</strong></div>)}</div><div className="week-body"><div className="time-col">{times.map(t => <span key={t}>{t}</span>)}</div>{days.map(day => <div className={`day-col ${dateKey(day) === today ? "today-col" : ""}`} key={dateKey(day)}>{times.map(t => <i key={t}></i>)}{visible.filter((e: any) => dateKey(e.startsAt) === dateKey(day)).map((e: any) => <article key={e.id} className={`calendar-event ${e.color}`} style={{ top: `${((parseInt(e.time) - 9) * 60 + parseInt(e.time.slice(3))) * 1.15 + 6}px`, height: `${e.duration * 60 * 1.15 - 4}px` }}><strong>{e.title}</strong><span>{e.time}</span><small>{e.place}</small>{e.attachments?.length ? <small>▧ {e.attachments.length} 个附件</small> : null}</article>)}</div>)}</div></div>; }
+function DayView({ events: visible, date }: { events: typeof events; date: Date }) { const dayEvents = visible.filter((e: any) => dateKey(e.startsAt) === dateKey(date)); return <div className="day-view"><div className="day-heading"><div><span>星期{["日","一","二","三","四","五","六"][date.getDay()]}</span><strong>{date.getDate()}</strong></div><p><strong>当日安排</strong><span>{dayEvents.length} 项日程</span></p></div><div className="day-schedule">{times.map(t => <div key={t}><span>{t}</span><i></i>{dayEvents.filter((e: any) => e.time.startsWith(t.slice(0, 2))).map((e: any) => <article key={e.id} className={`calendar-event ${e.color}`}><strong>{e.title}</strong><span>{e.time} · {e.place || "未填写地点"}</span>{e.attachments?.map((a: any) => <a key={a.id} href={`/api/attachments/${a.id}/download`}>▧ {a.name}</a>)}</article>)}</div>)}</div></div>; }
+function MonthView({ events: visible, date }: { events: typeof events; date: Date }) { const first = new Date(date.getFullYear(), date.getMonth(), 1); const start = mondayOf(first); const cells = Array.from({ length: 42 }, (_, i) => addDate(start, i, "day")); const today = dateKey(new Date()); return <div className="month-view"><div className="month-weekdays">{["一", "二", "三", "四", "五", "六", "日"].map(d => <span key={d}>周{d}</span>)}</div><div className="month-grid">{cells.map(day => <div key={dateKey(day)} className={`${dateKey(day) === today ? "today-cell" : ""} ${day.getMonth() !== date.getMonth() ? "muted" : ""}`}><strong>{day.getDate()}</strong>{visible.filter((e: any) => dateKey(e.startsAt) === dateKey(day)).map((e: any) => <span className={e.color} key={e.id}>{e.title}</span>)}</div>)}</div></div>; }
+function YearView({ events: visible, date }: { events: typeof events; date: Date }) { const today = new Date(); return <div className="year-view">{Array.from({ length: 12 }, (_, month) => { const first = new Date(date.getFullYear(), month, 1); const start = mondayOf(first); const cells = Array.from({ length: 42 }, (_, i) => addDate(start, i, "day")); return <div className={today.getFullYear() === date.getFullYear() && today.getMonth() === month ? "current-month" : ""} key={month}><h3>{month + 1} 月</h3><div className="mini-week">{["一", "二", "三", "四", "五", "六", "日"].map(d => <span key={d}>{d}</span>)}</div><div className="mini-days">{cells.map(day => <i key={dateKey(day)} className={day.getMonth() === month && visible.some((e: any) => dateKey(e.startsAt) === dateKey(day)) ? "has-event" : dateKey(day) === dateKey(today) ? "today" : ""}>{day.getMonth() === month ? day.getDate() : ""}</i>)}</div></div>; })}</div>; }
 
-function Settings() { return <div className="settings-page"><div className="calendar-heading"><div><p>工作台设置</p><h1>设置</h1><span>管理个人信息、账号与数据</span></div></div><div className="settings-layout"><aside><button className="active">个人信息</button><button>账号与安全</button><button>通知设置</button><button>数据与存储</button></aside><section className="settings-card"><div className="settings-avatar">WN<button>+</button></div><div><h3>个人信息</h3><p>这些信息会显示在你的个人工作台中。</p></div><label>姓名<input defaultValue="汪诺" /></label><label>登录账号<input defaultValue="wangnuo" /></label><label>邮箱<input defaultValue="wangnuo@example.com" /></label><button className="primary">保存修改</button></section></div></div>; }
+function Settings({ tab, onTab, profile, preferences, storage, counts, onSaved }: { tab: SettingsTab; onTab: (tab: SettingsTab) => void; profile: Profile; preferences: Preferences; storage: StorageInfo; counts: { projects: number; people: number; events: number }; onSaved: (message: string) => Promise<void> }) {
+  const [prefs, setPrefs] = useState(preferences);
+  useEffect(() => setPrefs(preferences), [preferences]);
+  const submitJson = async (url: string, body: unknown) => {
+    const response = await fetch(url, { method: "PUT", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "保存失败");
+  };
+  const saveProfile = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); try { await submitJson("/api/profile", data); await onSaved("个人信息已保存"); } catch (error) { await onSaved(error instanceof Error ? error.message : "保存失败"); } };
+  const savePassword = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); if (data.newPassword !== data.confirmPassword) return onSaved("两次输入的新密码不一致"); try { await submitJson("/api/password", data); event.currentTarget.reset(); await onSaved("密码已更新"); } catch (error) { await onSaved(error instanceof Error ? error.message : "更新失败"); } };
+  const savePreferences = async () => { try { await submitJson("/api/preferences", prefs); await onSaved("通知设置已保存"); } catch (error) { await onSaved(error instanceof Error ? error.message : "保存失败"); } };
+  const exportData = async () => { const response = await fetch("/api/export", { credentials: "include" }); if (!response.ok) return onSaved("导出失败"); const blob = await response.blob(); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `s-pm-export-${new Date().toISOString().slice(0, 10)}.json`; link.click(); URL.revokeObjectURL(link.href); await onSaved("数据导出已开始"); };
+  const nav: Array<[SettingsTab, string]> = [["profile", "个人信息"], ["security", "账号与安全"], ["notifications", "通知设置"], ["storage", "数据与存储"]];
+  return <div className="settings-page"><div className="calendar-heading"><div><p>工作台设置</p><h1>设置</h1><span>管理个人信息、账号与数据</span></div></div><div className="settings-layout"><aside>{nav.map(([id, label]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => onTab(id)}>{label}</button>)}</aside>
+    {tab === "profile" && <form className="settings-card" onSubmit={saveProfile}><div className="settings-avatar">{profile.displayName.slice(-2).toUpperCase()}</div><div><h3>个人信息</h3><p>这些信息会显示在你的个人工作台中。</p></div><label>姓名<input name="displayName" defaultValue={profile.displayName} required /></label><label>登录账号<input name="username" defaultValue={profile.username} required /></label><label>邮箱<input name="email" type="email" defaultValue={profile.email || ""} placeholder="可选" /></label><button className="primary" type="submit">保存修改</button></form>}
+    {tab === "security" && <form className="settings-card settings-form" onSubmit={savePassword}><div className="settings-icon">⌁</div><div><h3>账号与安全</h3><p>修改登录密码。新密码至少需要 8 位。</p></div><label>当前密码<input name="currentPassword" type="password" required autoComplete="current-password" /></label><label>新密码<input name="newPassword" type="password" minLength={8} required autoComplete="new-password" /></label><label>确认新密码<input name="confirmPassword" type="password" minLength={8} required autoComplete="new-password" /></label><button className="primary" type="submit">更新密码</button></form>}
+    {tab === "notifications" && <section className="settings-card settings-form"><div className="settings-icon">◌</div><div><h3>通知设置</h3><p>选择希望在工作台中看到的提醒。</p></div><Toggle label="日程开始提醒" note="日程临近时在工作台显示提醒" checked={prefs.scheduleReminders} onChange={value => setPrefs({ ...prefs, scheduleReminders: value })} /><Toggle label="项目状态变化" note="项目状态更新时显示通知" checked={prefs.projectUpdates} onChange={value => setPrefs({ ...prefs, projectUpdates: value })} /><Toggle label="每周工作摘要" note="每周汇总项目、人员和日程" checked={prefs.weeklyDigest} onChange={value => setPrefs({ ...prefs, weeklyDigest: value })} /><button className="primary" onClick={savePreferences}>保存设置</button></section>}
+    {tab === "storage" && <section className="settings-card settings-form"><div className="settings-icon">▣</div><div><h3>数据与存储</h3><p>业务数据保存在独立 SQLite 数据库，附件保存在腾讯 COS。</p></div><div className="storage-status"><span className={storage.configured ? "online" : "offline"}></span><div><strong>{storage.provider} · {storage.configured ? "已连接" : "待配置"}</strong><small>{storage.configured ? `${storage.bucket} · ${storage.region}` : "完成专用密钥配置后即可上传附件"}</small></div></div><div className="storage-counts"><span><strong>{counts.projects}</strong>项目</span><span><strong>{counts.people}</strong>人员</span><span><strong>{counts.events}</strong>日程</span></div><button className="primary" onClick={exportData}>导出全部数据</button></section>}
+  </div></div>;
+}
 
-function Modal({ type, onClose, onSave, projects, people }: { type: "project" | "person" | "event"; onClose: () => void; onSave: (e: FormEvent<HTMLFormElement>) => void; projects: typeof globalThisProjects; people: typeof globalThisPeople }) {
-  const fileRef = useRef<HTMLInputElement>(null); const [files, setFiles] = useState<string[]>([]);
+function Toggle({ label, note, checked, onChange }: { label: string; note: string; checked: boolean; onChange: (value: boolean) => void }) { return <label className="toggle-row"><span><strong>{label}</strong><small>{note}</small></span><input type="checkbox" checked={checked} onChange={event => onChange(event.target.checked)} /><i></i></label>; }
+
+function Modal({ type, onClose, onSave, projects, people }: { type: "project" | "person" | "event"; onClose: () => void; onSave: (e: FormEvent<HTMLFormElement>, files?: File[]) => void; projects: typeof globalThisProjects; people: typeof globalThisPeople }) {
+  const fileRef = useRef<HTMLInputElement>(null); const [files, setFiles] = useState<File[]>([]);
   const title = type === "project" ? "新建项目" : type === "person" ? "新建人员" : "新建日程";
-  return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}><form className="modal" onSubmit={onSave}><div className="modal-head"><div><span>{type === "event" ? "CALENDAR" : "NEW RECORD"}</span><h2>{title}</h2></div><button type="button" onClick={onClose}>×</button></div>
+  return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}><form className="modal" onSubmit={e => onSave(e, files)}><div className="modal-head"><div><span>{type === "event" ? "CALENDAR" : "NEW RECORD"}</span><h2>{title}</h2></div><button type="button" onClick={onClose}>×</button></div>
     {type === "project" && <><label>项目名称<input name="name" required placeholder="例如：秋季新品发布" /></label><div className="form-row"><label>客户 / 合作方<input name="client" placeholder="输入合作方" /></label><label>项目状态<select name="status"><option>提案中</option><option>进行中</option><option>已完成</option></select></label></div><div className="form-row"><label>开始日期<input name="startDate" type="date" /></label><label>结束日期<input name="endDate" type="date" /></label></div><label>所在地区<input name="region" placeholder="上海" /></label><label>项目备注<textarea name="notes" placeholder="记录项目目标和重要信息…"></textarea></label></>}
     {type === "person" && <><div className="form-row"><label>姓名<input name="name" required placeholder="联系人姓名" /></label><label>职位<input name="role" placeholder="品牌总监" /></label></div><label>公司 / 机构<input name="company" placeholder="所在公司" /></label><div className="form-row"><label>手机号<input name="phone" placeholder="138 0000 0000" /></label><label>所在地<input name="region" placeholder="杭州" /></label></div><label>备注<textarea name="notes" placeholder="记录彼此的合作偏好…"></textarea></label></>}
-    {type === "event" && <><label>日程标题<input name="title" required placeholder="例如：项目启动会" /></label><div className="form-row"><label>开始时间<input name="startsAt" type="datetime-local" required /></label><label>结束时间<input name="endsAt" type="datetime-local" required /></label></div><div className="form-row"><label>关联项目<select name="projectId"><option value="">请选择</option>{projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label><label>关联人员<select name="contactId"><option value="">请选择</option>{people.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label></div><label>地点<input name="location" placeholder="会议室或线上链接" /></label><label>备注<textarea name="description" placeholder="补充日程说明…"></textarea></label><div className="upload-area" onClick={() => fileRef.current?.click()}><input ref={fileRef} type="file" multiple accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx" onChange={e => setFiles(Array.from(e.target.files || []).map(f => f.name))} /><span>↑</span><div><strong>上传文件或图片</strong><small>附件将在接入腾讯 COS 后正式上传</small></div></div>{files.length > 0 && <div className="file-list">{files.map(f => <span key={f}>▧ {f}</span>)}</div>}</>}
+    {type === "event" && <><label>日程标题<input name="title" required placeholder="例如：项目启动会" /></label><div className="form-row"><label>开始时间<input name="startsAt" type="datetime-local" required /></label><label>结束时间<input name="endsAt" type="datetime-local" required /></label></div><div className="form-row"><label>关联项目<select name="projectId"><option value="">请选择</option>{projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label><label>关联人员<select name="contactId"><option value="">请选择</option>{people.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label></div><label>地点<input name="location" placeholder="会议室或线上链接" /></label><label>备注<textarea name="description" placeholder="补充日程说明…"></textarea></label><div className="upload-area" onClick={() => fileRef.current?.click()}><input ref={fileRef} type="file" multiple accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx" onChange={e => setFiles(Array.from(e.target.files || []))} /><span>↑</span><div><strong>上传文件或图片</strong><small>单个文件不超过 25MB，保存日程时上传至腾讯 COS</small></div></div>{files.length > 0 && <div className="file-list">{files.map(f => <span key={`${f.name}-${f.size}`}>▧ {f.name} · {(f.size / 1024 / 1024).toFixed(1)}MB</span>)}</div>}</>}
     <div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button className="primary" type="submit">保存{type === "event" ? "日程" : ""}</button></div></form></div>;
 }
 
-function SearchOverlay({ query, setQuery, results, onClose, onChoose }: any) { return <div className="search-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}><div className="search-box"><div className="search-input"><span>⌕</span><input autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索项目、联系人…" /><kbd onClick={onClose}>ESC</kbd></div>{query ? <div className="search-results"><p>搜索结果 · {results.length}</p>{results.length ? results.map((r: any) => <button key={`${r.type}${r.id}`} onClick={() => onChoose(r)}><span>{r.type === "项目" ? "□" : "○"}</span><div><strong>{r.name}</strong><small>{r.type === "项目" ? `${r.client} · ${r.region}` : `${r.company} · ${r.role}`}</small></div><em>{r.type}</em></button>) : <div className="empty-search">没有找到匹配内容</div>}</div> : <div className="search-suggestions"><p>快速访问</p><button><span>⌘</span>查看本周日程</button><button><span>□</span>查看进行中项目</button></div>}<div className="search-foot">↑↓ 选择　↵ 打开　ESC 关闭</div></div></div>; }
+function SearchOverlay({ query, setQuery, results, onClose, onChoose, onWeek, onOngoing }: any) { return <div className="search-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}><div className="search-box"><div className="search-input"><span>⌕</span><input autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索项目、联系人或日程…" /><kbd onClick={onClose}>ESC</kbd></div>{query ? <div className="search-results"><p>搜索结果 · {results.length}</p>{results.length ? results.map((r: any) => <button key={`${r.type}${r.id}`} onClick={() => onChoose(r)}><span>{r.type === "项目" ? "□" : r.type === "联系人" ? "○" : "⌘"}</span><div><strong>{r.name}</strong><small>{r.type === "项目" ? `${r.client || "无合作方"} · ${r.region || "无地区"}` : r.type === "联系人" ? `${r.company || "无公司"} · ${r.role || "无职位"}` : `${r.time} · ${r.place || "未填写地点"}`}</small></div><em>{r.type}</em></button>) : <div className="empty-search">没有找到匹配内容</div>}</div> : <div className="search-suggestions"><p>快速访问</p><button onClick={onWeek}><span>⌘</span>查看本周日程</button><button onClick={onOngoing}><span>□</span>查看进行中项目</button></div>}<div className="search-foot">输入关键词后选择结果　·　ESC 关闭</div></div></div>; }

@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import COS from "cos-nodejs-sdk-v5";
 
 const host = process.env.SPM_API_HOST || "127.0.0.1";
 const port = Number(process.env.SPM_API_PORT || 3110);
@@ -11,6 +12,22 @@ mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
 const db = new DatabaseSync(join(dataDir, "s-pm.sqlite"));
 db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+db.exec(`CREATE TABLE IF NOT EXISTS user_settings (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  schedule_reminders INTEGER NOT NULL DEFAULT 1,
+  project_updates INTEGER NOT NULL DEFAULT 1,
+  weekly_digest INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);`);
+
+const cosConfig = {
+  secretId: process.env.TENCENT_COS_SECRET_ID || "",
+  secretKey: process.env.TENCENT_COS_SECRET_KEY || "",
+  bucket: process.env.TENCENT_COS_BUCKET || "",
+  region: process.env.TENCENT_COS_REGION || "",
+};
+const cosConfigured = Object.values(cosConfig).every(Boolean);
+const cos = cosConfigured ? new COS({ SecretId: cosConfig.secretId, SecretKey: cosConfig.secretKey }) : null;
 
 const secretPath = process.env.SPM_SESSION_SECRET_FILE || join(dataDir, "session-secret");
 let sessionSecret;
@@ -89,21 +106,30 @@ function contactRows() {
 }
 
 function scheduleRows() {
-  return db.prepare(`SELECT s.id, s.title, s.description, s.location AS place, s.starts_at AS startsAt, s.ends_at AS endsAt,
+  const rows = db.prepare(`SELECT s.id, s.title, s.description, s.location AS place, s.starts_at AS startsAt, s.ends_at AS endsAt,
     sp.project_id AS project, sc.contact_id AS person FROM schedules s
     LEFT JOIN schedule_projects sp ON sp.schedule_id = s.id
-    LEFT JOIN schedule_contacts sc ON sc.schedule_id = s.id ORDER BY s.starts_at`).all().map((row, index) => {
+    LEFT JOIN schedule_contacts sc ON sc.schedule_id = s.id ORDER BY s.starts_at`).all();
+  const attachmentQuery = db.prepare("SELECT id, original_name AS name, content_type AS type, size_bytes AS size FROM attachments WHERE schedule_id = ? ORDER BY created_at");
+  return rows.map((row, index) => {
       const start = new Date(String(row.startsAt));
       const end = new Date(String(row.endsAt));
-      return { ...row, id: Number(row.id), project: row.project == null ? null : String(row.project), person: row.person == null ? null : String(row.person), day: start.getDate(), time: start.toTimeString().slice(0, 5), duration: Math.max(.5, (end.getTime() - start.getTime()) / 3600000), color: colors[index % colors.length] };
+      return { ...row, id: Number(row.id), project: row.project == null ? null : String(row.project), person: row.person == null ? null : String(row.person), day: start.getDate(), time: start.toTimeString().slice(0, 5), duration: Math.max(.5, (end.getTime() - start.getTime()) / 3600000), color: colors[index % colors.length], attachments: attachmentQuery.all(row.id) };
     });
 }
 
-function bootstrap() {
+function settingsFor(userId) {
+  db.prepare("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)").run(userId);
+  const row = db.prepare("SELECT schedule_reminders, project_updates, weekly_digest FROM user_settings WHERE user_id = ?").get(userId);
+  return { scheduleReminders: Boolean(row.schedule_reminders), projectUpdates: Boolean(row.project_updates), weeklyDigest: Boolean(row.weekly_digest) };
+}
+
+function bootstrap(userId) {
   const projects = projectRows();
   const people = contactRows();
   const events = scheduleRows();
-  return { projects, people, events };
+  const profile = db.prepare("SELECT username, display_name AS displayName, email FROM users WHERE id = ?").get(userId);
+  return { projects, people, events, profile, preferences: settingsFor(userId), storage: { provider: "腾讯云 COS", configured: cosConfigured, bucket: cosConfigured ? cosConfig.bucket : null, region: cosConfigured ? cosConfig.region : null } };
 }
 
 function required(value, label) {
@@ -140,7 +166,45 @@ const server = createServer(async (req, res) => {
     const user = getUser(req);
     if (!user) return send(res, 401, { error: "请先登录" });
     if (req.method === "GET" && url.pathname === "/api/session") return send(res, 200, { user });
-    if (req.method === "GET" && url.pathname === "/api/bootstrap") return send(res, 200, bootstrap());
+    if (req.method === "GET" && url.pathname === "/api/bootstrap") return send(res, 200, bootstrap(user.id));
+
+    if (req.method === "PUT" && url.pathname === "/api/profile") {
+      const body = await readJson(req);
+      const username = required(body.username, "登录账号");
+      const displayName = required(body.displayName, "姓名");
+      db.prepare("UPDATE users SET username = ?, display_name = ?, email = ?, updated_at = datetime('now') WHERE id = ?")
+        .run(username, displayName, body.email || null, user.id);
+      const updated = db.prepare("SELECT id, username, display_name FROM users WHERE id = ?").get(user.id);
+      const secure = req.headers["x-forwarded-proto"] === "https";
+      const cookie = `spm_session=${encodeURIComponent(createToken(updated))}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800${secure ? "; Secure" : ""}`;
+      return send(res, 200, { ok: true }, { "set-cookie": cookie });
+    }
+
+    if (req.method === "PUT" && url.pathname === "/api/password") {
+      const body = await readJson(req);
+      const row = db.prepare("SELECT password_hash FROM users WHERE id = ?").get(user.id);
+      if (!verifyPassword(String(body.currentPassword || ""), row.password_hash)) return send(res, 400, { error: "当前密码不正确" });
+      const password = required(body.newPassword, "新密码");
+      if (password.length < 8) return send(res, 400, { error: "新密码至少需要 8 位" });
+      const salt = randomBytes(16).toString("hex");
+      const passwordHash = `scrypt$${salt}$${scryptSync(password, salt, 64).toString("hex")}`;
+      db.prepare("UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?").run(passwordHash, user.id);
+      return send(res, 200, { ok: true });
+    }
+
+    if (req.method === "PUT" && url.pathname === "/api/preferences") {
+      const body = await readJson(req);
+      db.prepare(`INSERT INTO user_settings (user_id, schedule_reminders, project_updates, weekly_digest, updated_at)
+        VALUES (?, ?, ?, ?, datetime('now')) ON CONFLICT(user_id) DO UPDATE SET
+        schedule_reminders = excluded.schedule_reminders, project_updates = excluded.project_updates,
+        weekly_digest = excluded.weekly_digest, updated_at = datetime('now')`)
+        .run(user.id, body.scheduleReminders ? 1 : 0, body.projectUpdates ? 1 : 0, body.weeklyDigest ? 1 : 0);
+      return send(res, 200, { ok: true });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/export") {
+      return send(res, 200, { exportedAt: new Date().toISOString(), ...bootstrap(user.id) }, { "content-disposition": `attachment; filename="s-pm-export-${new Date().toISOString().slice(0, 10)}.json"` });
+    }
 
     if (req.method === "POST" && url.pathname === "/api/projects") {
       const body = await readJson(req);
@@ -170,6 +234,32 @@ const server = createServer(async (req, res) => {
         db.exec("COMMIT");
         return send(res, 201, { id: String(id) });
       } catch (error) { db.exec("ROLLBACK"); throw error; }
+    }
+
+    const uploadMatch = url.pathname.match(/^\/api\/schedules\/(\d+)\/attachments$/);
+    if (req.method === "POST" && uploadMatch) {
+      if (!cos) return send(res, 503, { error: "腾讯 COS 尚未完成配置" });
+      const scheduleId = Number(uploadMatch[1]);
+      if (!db.prepare("SELECT id FROM schedules WHERE id = ?").get(scheduleId)) return send(res, 404, { error: "日程不存在" });
+      const originalName = required(url.searchParams.get("name"), "文件名").slice(0, 240);
+      const contentLength = Number(req.headers["content-length"] || 0);
+      if (!contentLength || contentLength > 25 * 1024 * 1024) return send(res, 413, { error: "文件大小需在 25MB 以内" });
+      const safeName = originalName.replace(/[^\p{L}\p{N}._-]+/gu, "-");
+      const objectKey = `s-pm/schedules/${scheduleId}/${Date.now()}-${randomBytes(6).toString("hex")}-${safeName}`;
+      const uploaded = await cos.putObject({ Bucket: cosConfig.bucket, Region: cosConfig.region, Key: objectKey, Body: req, ContentLength: contentLength, ContentType: String(req.headers["content-type"] || "application/octet-stream") });
+      const result = db.prepare(`INSERT INTO attachments (schedule_id, original_name, object_key, content_type, size_bytes, cos_etag)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(scheduleId, originalName, objectKey, req.headers["content-type"] || null, contentLength, uploaded.ETag || null);
+      return send(res, 201, { id: Number(result.lastInsertRowid), name: originalName });
+    }
+
+    const downloadMatch = url.pathname.match(/^\/api\/attachments\/(\d+)\/download$/);
+    if (req.method === "GET" && downloadMatch) {
+      if (!cos) return send(res, 503, { error: "腾讯 COS 尚未完成配置" });
+      const attachment = db.prepare("SELECT object_key FROM attachments WHERE id = ?").get(Number(downloadMatch[1]));
+      if (!attachment) return send(res, 404, { error: "附件不存在" });
+      const signedUrl = cos.getObjectUrl({ Bucket: cosConfig.bucket, Region: cosConfig.region, Key: attachment.object_key, Sign: true, Method: "GET", Expires: 300, Protocol: "https:" });
+      res.writeHead(302, { location: signedUrl, "cache-control": "no-store" });
+      return res.end();
     }
 
     return send(res, 404, { error: "未找到接口" });
