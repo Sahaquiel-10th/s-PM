@@ -3,8 +3,9 @@ module.exports = {
     {
       name: "s-pm-web",
       cwd: "/home/ubuntu/s-pm",
-      script: "./node_modules/.bin/vinext",
+      script: "./node_modules/vinext/dist/cli.js",
       args: "start --hostname 127.0.0.1 --port 3108",
+      interpreter: "node",
       instances: 1,
       exec_mode: "fork",
       autorestart: true,
