@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Section = "dashboard" | "projects" | "people" | "settings";
 type CalendarMode = "日" | "周" | "月" | "年";
@@ -34,7 +34,11 @@ const Icon = ({ children }: { children: string }) => <span className="nav-icon" 
 
 export default function Home() {
   const [loggedIn, setLoggedIn] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
   const [loginError, setLoginError] = useState("");
+  const [projectItems, setProjectItems] = useState(projects);
+  const [peopleItems, setPeopleItems] = useState(people);
+  const [eventItems, setEventItems] = useState(events);
   const [section, setSection] = useState<Section>("dashboard");
   const [selectedProject, setSelectedProject] = useState<string | null>(null);
   const [selectedPerson, setSelectedPerson] = useState<string | null>(null);
@@ -48,28 +52,63 @@ export default function Home() {
     const q = query.trim().toLowerCase();
     if (!q) return [];
     return [
-      ...projects.filter(p => `${p.name}${p.client}${p.region}`.toLowerCase().includes(q)).map(p => ({ ...p, type: "项目" })),
-      ...people.filter(p => `${p.name}${p.company}${p.role}`.toLowerCase().includes(q)).map(p => ({ ...p, type: "联系人" })),
+      ...projectItems.filter(p => `${p.name}${p.client}${p.region}`.toLowerCase().includes(q)).map(p => ({ ...p, type: "项目" })),
+      ...peopleItems.filter(p => `${p.name}${p.company}${p.role}`.toLowerCase().includes(q)).map(p => ({ ...p, type: "联系人" })),
     ].slice(0, 6);
-  }, [query]);
+  }, [query, projectItems, peopleItems]);
 
-  function login(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    const form = new FormData(e.currentTarget);
-    if (form.get("username") === "demo" && form.get("password") === "demo") {
+  useEffect(() => {
+    fetch("/api/session", { credentials: "include" }).then(response => {
+      if (!response.ok) throw new Error();
       setLoggedIn(true);
-      setLoginError("");
-    } else setLoginError("账号或密码不正确，请使用 demo / demo");
+      return loadData();
+    }).catch(() => undefined).finally(() => setAuthReady(true));
+  }, []);
+
+  async function loadData() {
+    const response = await fetch("/api/bootstrap", { credentials: "include" });
+    if (!response.ok) throw new Error("数据加载失败");
+    const data = await response.json();
+    setProjectItems(data.projects || []);
+    setPeopleItems(data.people || []);
+    setEventItems(data.events || []);
   }
 
-  function saveModal(e: FormEvent<HTMLFormElement>) {
+  async function login(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    const form = new FormData(e.currentTarget);
+    setLoginError("");
+    const response = await fetch("/api/login", { method: "POST", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify({ username: form.get("username"), password: form.get("password") }) });
+    if (response.ok) {
+      setLoggedIn(true);
+      await loadData();
+    } else {
+      const data = await response.json().catch(() => ({}));
+      setLoginError(data.error || "账号或密码不正确");
+    }
+  }
+
+  async function saveModal(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (!modal) return;
+    const form = new FormData(e.currentTarget);
+    const body = Object.fromEntries(form.entries());
+    const endpoint = modal === "project" ? "projects" : modal === "person" ? "contacts" : "schedules";
+    const response = await fetch(`/api/${endpoint}`, { method: "POST", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      setToast(data.error || "保存失败");
+      window.setTimeout(() => setToast(""), 3000);
+      return;
+    }
     const labels = { project: "项目", person: "人员", event: "日程" };
-    setToast(`${modal ? labels[modal] : "内容"}已保存（演示）`);
+    await loadData();
+    setToast(`${labels[modal]}已保存`);
     setModal(null);
     window.setTimeout(() => setToast(""), 2400);
   }
 
+  if (!authReady) return <main className="login-page"><section className="login-story"></section><section className="login-form-wrap"><div className="login-form"><p className="login-kicker">澄序</p><h2>正在打开工作台…</h2></div></section></main>;
   if (!loggedIn) return <Login onSubmit={login} error={loginError} />;
 
   const goSection = (next: Section) => {
@@ -79,12 +118,12 @@ export default function Home() {
   };
 
   const calendarTitle = section === "projects" && selectedProject
-    ? projects.find(p => p.id === selectedProject)?.name
+    ? projectItems.find(p => p.id === selectedProject)?.name
     : section === "people" && selectedPerson
-      ? people.find(p => p.id === selectedPerson)?.name
+      ? peopleItems.find(p => p.id === selectedPerson)?.name
       : "全部日程";
 
-  const filteredEvents = events.filter(event => {
+  const filteredEvents = eventItems.filter(event => {
     if (section === "projects" && selectedProject) return event.project === selectedProject;
     if (section === "people" && selectedPerson) return event.person === selectedPerson;
     return true;
@@ -96,12 +135,12 @@ export default function Home() {
         <div className="brand"><span className="brand-mark">澄</span><span>澄序</span></div>
         <nav className="main-nav" aria-label="主导航">
           <button className={section === "dashboard" ? "active" : ""} onClick={() => goSection("dashboard")}><Icon children="◫" />看板</button>
-          <button className={section === "projects" ? "active" : ""} onClick={() => goSection("projects")}><Icon children="□" />项目<span className="nav-count">12</span></button>
-          <button className={section === "people" ? "active" : ""} onClick={() => goSection("people")}><Icon children="○" />人员<span className="nav-count">36</span></button>
+          <button className={section === "projects" ? "active" : ""} onClick={() => goSection("projects")}><Icon children="□" />项目<span className="nav-count">{projectItems.length}</span></button>
+          <button className={section === "people" ? "active" : ""} onClick={() => goSection("people")}><Icon children="○" />人员<span className="nav-count">{peopleItems.length}</span></button>
           <button className={section === "settings" ? "active" : ""} onClick={() => goSection("settings")}><Icon children="⌘" />设置</button>
         </nav>
         <div className="sidebar-foot">
-          <div className="mini-avatar">WN</div><div><strong>汪诺</strong><span>个人工作台</span></div><button onClick={() => setLoggedIn(false)} title="退出登录">→</button>
+          <div className="mini-avatar">WN</div><div><strong>汪诺</strong><span>个人工作台</span></div><button onClick={async () => { await fetch("/api/logout", { method: "POST" }); setLoggedIn(false); }} title="退出登录">→</button>
         </div>
       </aside>
 
@@ -111,6 +150,8 @@ export default function Home() {
           selected={section === "projects" ? selectedProject : selectedPerson}
           onSelect={section === "projects" ? setSelectedProject : setSelectedPerson}
           onCreate={() => setModal(section === "projects" ? "project" : "person")}
+          projects={projectItems}
+          people={peopleItems}
         />
       )}
 
@@ -121,7 +162,7 @@ export default function Home() {
         </header>
 
         <div className="content">
-          {section === "dashboard" && <Dashboard onNavigate={goSection} />}
+          {section === "dashboard" && <Dashboard onNavigate={goSection} projects={projectItems} people={peopleItems} events={eventItems} />}
           {(section === "projects" || section === "people") && (
             <CalendarPage
               title={calendarTitle || "全部日程"}
@@ -136,7 +177,7 @@ export default function Home() {
         </div>
       </section>
 
-      {modal && <Modal type={modal} onClose={() => setModal(null)} onSave={saveModal} />}
+      {modal && <Modal type={modal} onClose={() => setModal(null)} onSave={saveModal} projects={projectItems} people={peopleItems} />}
       {searchOpen && <SearchOverlay query={query} setQuery={setQuery} results={searchResults} onClose={() => { setSearchOpen(false); setQuery(""); }} onChoose={(item: any) => {
         if (item.type === "项目") { setSection("projects"); setSelectedProject(item.id); }
         else { setSection("people"); setSelectedPerson(item.id); }
@@ -158,18 +199,18 @@ function Login({ onSubmit, error }: { onSubmit: (e: FormEvent<HTMLFormElement>) 
     <section className="login-form-wrap">
       <form className="login-form" onSubmit={onSubmit}>
         <p className="login-kicker">欢迎回来</p><h2>登录澄序</h2><p className="login-hint">继续管理你的项目与合作网络</p>
-        <label>账号<input name="username" placeholder="请输入账号" defaultValue="demo" autoFocus /></label>
-        <label>密码<input name="password" type="password" placeholder="请输入密码" defaultValue="demo" /></label>
+        <label>账号<input name="username" placeholder="请输入账号" defaultValue="汪诺" autoFocus /></label>
+        <label>密码<input name="password" type="password" placeholder="请输入密码" /></label>
         <div className="login-options"><label><input type="checkbox" defaultChecked /> 记住我</label><button type="button">忘记密码？</button></div>
         {error && <p className="login-error">{error}</p>}
         <button className="login-submit" type="submit">登录 <span>→</span></button>
-        <p className="demo-note">演示账号：<code>demo</code> 密码：<code>demo</code></p>
+        <p className="demo-note">账号由项目所有人管理</p>
       </form>
     </section>
   </main>;
 }
 
-function SecondaryPanel({ type, selected, onSelect, onCreate }: { type: "projects" | "people"; selected: string | null; onSelect: (id: string | null) => void; onCreate: () => void }) {
+function SecondaryPanel({ type, selected, onSelect, onCreate, projects, people }: { type: "projects" | "people"; selected: string | null; onSelect: (id: string | null) => void; onCreate: () => void; projects: typeof globalThisProjects; people: typeof globalThisPeople }) {
   const list = type === "projects" ? projects : people;
   return <aside className="secondary">
     <div className="secondary-head"><div><span>{type === "projects" ? "项目列表" : "联系人"}</span><strong>{list.length}</strong></div><button onClick={onCreate}>+　{type === "projects" ? "新建项目" : "新建人员"}</button></div>
@@ -185,13 +226,29 @@ function SecondaryPanel({ type, selected, onSelect, onCreate }: { type: "project
   </aside>;
 }
 
-function Dashboard({ onNavigate }: { onNavigate: (s: Section) => void }) {
+const globalThisProjects = projects;
+const globalThisPeople = people;
+const globalThisEvents = events;
+
+function Dashboard({ onNavigate, projects, people, events }: { onNavigate: (s: Section) => void; projects: typeof globalThisProjects; people: typeof globalThisPeople; events: typeof globalThisEvents }) {
+  const ongoing = projects.filter(p => p.status === "进行中").length;
+  const proposal = projects.filter(p => p.status === "提案中").length;
+  const done = projects.filter(p => p.status === "已完成").length;
+  const regionRows = (items: Array<{region?: string | null}>) => {
+    const counts = new Map<string, number>();
+    items.forEach(item => item.region && counts.set(item.region, (counts.get(item.region) || 0) + 1));
+    const rows = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+    const max = rows[0]?.[1] || 1;
+    return rows.map(([name, count]) => [name, count, Math.round(count / max * 100)] as (string | number)[]);
+  };
+  const projectRegions = regionRows(projects);
+  const peopleRegions = regionRows(people);
   return <div className="dashboard">
     <div className="page-title"><div><p>2026 年 8 月 9 日，星期日</p><h1>上午好，汪诺 <span>✦</span></h1><p>这是你的工作全景，今天也一起有序推进。</p></div><button className="primary" onClick={() => onNavigate("projects")}>+　记录新项目</button></div>
     <div className="metrics-grid">
-      <Metric icon="□" label="项目总数" value="12" note="本月新增 2" tone="coral" onClick={() => onNavigate("projects")} />
-      <Metric icon="○" label="联系人总数" value="36" note="本月新增 5" tone="violet" onClick={() => onNavigate("people")} />
-      <div className="metric-card status-card"><div className="metric-head"><span>项目状态</span><i>近 12 个月</i></div><div className="status-values"><div><strong>5</strong><span><i className="dot ongoing"></i>进行中</span></div><div><strong>3</strong><span><i className="dot proposal"></i>提案中</span></div><div><strong>4</strong><span><i className="dot done"></i>已完成</span></div></div><div className="status-bar"><i></i><i></i><i></i></div></div>
+      <Metric icon="□" label="项目总数" value={String(projects.length)} note="服务器实时数据" tone="coral" onClick={() => onNavigate("projects")} />
+      <Metric icon="○" label="联系人总数" value={String(people.length)} note="服务器实时数据" tone="violet" onClick={() => onNavigate("people")} />
+      <div className="metric-card status-card"><div className="metric-head"><span>项目状态</span><i>全部项目</i></div><div className="status-values"><div><strong>{ongoing}</strong><span><i className="dot ongoing"></i>进行中</span></div><div><strong>{proposal}</strong><span><i className="dot proposal"></i>提案中</span></div><div><strong>{done}</strong><span><i className="dot done"></i>已完成</span></div></div><div className="status-bar"><i></i><i></i><i></i></div></div>
     </div>
     <div className="dashboard-grid">
       <section className="panel cooperation"><PanelTitle title="合作最多的联系人" subtitle="按参与项目数量" action="查看全部" />
@@ -200,15 +257,15 @@ function Dashboard({ onNavigate }: { onNavigate: (s: Section) => void }) {
       <section className="panel schedule"><PanelTitle title="近期日程" subtitle="未来 7 天" action="查看日历" />
         <div className="schedule-list"><div><time><strong>10</strong><span>8月 周一</span></time><i className="timeline coral"></i><p><strong>品牌内容工作坊</strong><span>09:30—11:30 · 美湖文旅</span></p><em>进行中</em></div><div><time><strong>12</strong><span>8月 周三</span></time><i className="timeline violet"></i><p><strong>视觉提案内审</strong><span>14:00—15:30 · MORI Studio</span></p><em>待开始</em></div><div><time><strong>13</strong><span>8月 周四</span></time><i className="timeline gold"></i><p><strong>展厅动线沟通</strong><span>10:30—12:30 · NOVA 科技</span></p><em>待开始</em></div></div>
       </section>
-      <RegionPanel title="项目地区分布" total="12 个项目" data={[["上海", 4, 100], ["杭州", 3, 74], ["深圳", 2, 52], ["厦门", 2, 52], ["青岛", 1, 28]]} tone="coral" />
-      <RegionPanel title="联系人地区分布" total="36 位联系人" data={[["上海", 12, 100], ["杭州", 9, 76], ["深圳", 6, 52], ["北京", 5, 44], ["厦门", 4, 35]]} tone="violet" />
+      <RegionPanel title="项目地区分布" total={`${projects.length} 个项目`} data={projectRegions} tone="coral" />
+      <RegionPanel title="联系人地区分布" total={`${people.length} 位联系人`} data={peopleRegions} tone="violet" />
     </div>
   </div>;
 }
 
 function Metric({ icon, label, value, note, tone, onClick }: any) { return <button className={`metric-card simple ${tone}`} onClick={onClick}><span className="metric-icon">{icon}</span><p>{label}<strong>{value}</strong></p><span className="trend">↗</span><small>{note}</small></button>; }
 function PanelTitle({ title, subtitle, action }: { title: string; subtitle: string; action: string }) { return <div className="panel-title"><div><h3>{title}</h3><p>{subtitle}</p></div><button>{action} ›</button></div>; }
-function RegionPanel({ title, total, data, tone }: { title: string; total: string; data: (string | number)[][]; tone: string }) { return <section className={`panel region ${tone}`}><PanelTitle title={title} subtitle={total} action="详情" /><div className="region-body"><div className="donut"><div><strong>{data.length}</strong><span>覆盖城市</span></div></div><div className="region-bars">{data.map((r, i) => <div key={String(r[0])}><b>{i + 1}</b><span>{r[0]}</span><i><em style={{ width: `${r[2]}%` }}></em></i><strong>{r[1]}</strong></div>)}</div></div></section>; }
+function RegionPanel({ title, total, data, tone }: { title: string; total: string; data: (string | number)[][]; tone: string }) { return <section className={`panel region ${tone}`}><PanelTitle title={title} subtitle={total} action="详情" /><div className="region-body"><div className="donut"><div><strong>{data.length}</strong><span>覆盖城市</span></div></div><div className="region-bars">{data.length ? data.map((r, i) => <div key={String(r[0])}><b>{i + 1}</b><span>{r[0]}</span><i><em style={{ width: `${r[2]}%` }}></em></i><strong>{r[1]}</strong></div>) : <div><span>暂无地区数据</span></div>}</div></div></section>; }
 
 function CalendarPage({ title, subtitle, mode, onMode, events: filtered, onCreate }: { title: string; subtitle: string; mode: CalendarMode; onMode: (m: CalendarMode) => void; events: typeof events; onCreate: () => void }) {
   return <div className="calendar-page">
@@ -231,13 +288,13 @@ function YearView({ events: visible }: { events: typeof events }) { return <div 
 
 function Settings() { return <div className="settings-page"><div className="calendar-heading"><div><p>工作台设置</p><h1>设置</h1><span>管理个人信息、账号与数据</span></div></div><div className="settings-layout"><aside><button className="active">个人信息</button><button>账号与安全</button><button>通知设置</button><button>数据与存储</button></aside><section className="settings-card"><div className="settings-avatar">WN<button>+</button></div><div><h3>个人信息</h3><p>这些信息会显示在你的个人工作台中。</p></div><label>姓名<input defaultValue="汪诺" /></label><label>登录账号<input defaultValue="wangnuo" /></label><label>邮箱<input defaultValue="wangnuo@example.com" /></label><button className="primary">保存修改</button></section></div></div>; }
 
-function Modal({ type, onClose, onSave }: { type: "project" | "person" | "event"; onClose: () => void; onSave: (e: FormEvent<HTMLFormElement>) => void }) {
+function Modal({ type, onClose, onSave, projects, people }: { type: "project" | "person" | "event"; onClose: () => void; onSave: (e: FormEvent<HTMLFormElement>) => void; projects: typeof globalThisProjects; people: typeof globalThisPeople }) {
   const fileRef = useRef<HTMLInputElement>(null); const [files, setFiles] = useState<string[]>([]);
   const title = type === "project" ? "新建项目" : type === "person" ? "新建人员" : "新建日程";
   return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}><form className="modal" onSubmit={onSave}><div className="modal-head"><div><span>{type === "event" ? "CALENDAR" : "NEW RECORD"}</span><h2>{title}</h2></div><button type="button" onClick={onClose}>×</button></div>
-    {type === "project" && <><label>项目名称<input required placeholder="例如：秋季新品发布" /></label><div className="form-row"><label>客户 / 合作方<input placeholder="输入合作方" /></label><label>项目状态<select><option>提案中</option><option>进行中</option><option>已完成</option></select></label></div><div className="form-row"><label>开始日期<input type="date" /></label><label>所在地区<input placeholder="上海" /></label></div><label>项目备注<textarea placeholder="记录项目目标和重要信息…"></textarea></label></>}
-    {type === "person" && <><div className="form-row"><label>姓名<input required placeholder="联系人姓名" /></label><label>职位<input placeholder="品牌总监" /></label></div><label>公司 / 机构<input placeholder="所在公司" /></label><div className="form-row"><label>手机号<input placeholder="138 0000 0000" /></label><label>所在地<input placeholder="杭州" /></label></div><label>备注<textarea placeholder="记录彼此的合作偏好…"></textarea></label></>}
-    {type === "event" && <><label>日程标题<input required placeholder="例如：项目启动会" /></label><div className="form-row"><label>开始时间<input type="datetime-local" /></label><label>结束时间<input type="datetime-local" /></label></div><div className="form-row"><label>关联项目<select><option>请选择</option>{projects.map(p => <option key={p.id}>{p.name}</option>)}</select></label><label>关联人员<select><option>请选择</option>{people.map(p => <option key={p.id}>{p.name}</option>)}</select></label></div><label>地点<input placeholder="会议室或线上链接" /></label><label>备注<textarea placeholder="补充日程说明…"></textarea></label><div className="upload-area" onClick={() => fileRef.current?.click()}><input ref={fileRef} type="file" multiple accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx" onChange={e => setFiles(Array.from(e.target.files || []).map(f => f.name))} /><span>↑</span><div><strong>上传文件或图片</strong><small>点击选择，支持图片、PDF、Office 文件</small></div></div>{files.length > 0 && <div className="file-list">{files.map(f => <span key={f}>▧ {f}</span>)}</div>}</>}
+    {type === "project" && <><label>项目名称<input name="name" required placeholder="例如：秋季新品发布" /></label><div className="form-row"><label>客户 / 合作方<input name="client" placeholder="输入合作方" /></label><label>项目状态<select name="status"><option>提案中</option><option>进行中</option><option>已完成</option></select></label></div><div className="form-row"><label>开始日期<input name="startDate" type="date" /></label><label>结束日期<input name="endDate" type="date" /></label></div><label>所在地区<input name="region" placeholder="上海" /></label><label>项目备注<textarea name="notes" placeholder="记录项目目标和重要信息…"></textarea></label></>}
+    {type === "person" && <><div className="form-row"><label>姓名<input name="name" required placeholder="联系人姓名" /></label><label>职位<input name="role" placeholder="品牌总监" /></label></div><label>公司 / 机构<input name="company" placeholder="所在公司" /></label><div className="form-row"><label>手机号<input name="phone" placeholder="138 0000 0000" /></label><label>所在地<input name="region" placeholder="杭州" /></label></div><label>备注<textarea name="notes" placeholder="记录彼此的合作偏好…"></textarea></label></>}
+    {type === "event" && <><label>日程标题<input name="title" required placeholder="例如：项目启动会" /></label><div className="form-row"><label>开始时间<input name="startsAt" type="datetime-local" required /></label><label>结束时间<input name="endsAt" type="datetime-local" required /></label></div><div className="form-row"><label>关联项目<select name="projectId"><option value="">请选择</option>{projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label><label>关联人员<select name="contactId"><option value="">请选择</option>{people.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label></div><label>地点<input name="location" placeholder="会议室或线上链接" /></label><label>备注<textarea name="description" placeholder="补充日程说明…"></textarea></label><div className="upload-area" onClick={() => fileRef.current?.click()}><input ref={fileRef} type="file" multiple accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx" onChange={e => setFiles(Array.from(e.target.files || []).map(f => f.name))} /><span>↑</span><div><strong>上传文件或图片</strong><small>附件将在接入腾讯 COS 后正式上传</small></div></div>{files.length > 0 && <div className="file-list">{files.map(f => <span key={f}>▧ {f}</span>)}</div>}</>}
     <div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button className="primary" type="submit">保存{type === "event" ? "日程" : ""}</button></div></form></div>;
 }
 
