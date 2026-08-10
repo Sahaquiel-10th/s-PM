@@ -55,6 +55,9 @@ test("list records and calendar events provide rich hover details", async () => 
   assert.match(page, /function HoverDetails/);
   assert.match(page, /function EventHover/);
   assert.match(page, /className="hover-details"/);
+  assert.match(page, /createPortal/);
+  assert.match(page, /getBoundingClientRect/);
   assert.match(css, /\.hover-details/);
-  assert.match(css, /\.calendar-event:hover \.hover-details/);
+  assert.match(css, /position:fixed/);
+  assert.match(css, /z-index:100/);
 });

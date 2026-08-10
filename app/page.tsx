@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 type Section = "dashboard" | "projects" | "people" | "settings";
 type CalendarMode = "日" | "周" | "月" | "年";
@@ -272,7 +273,41 @@ function Login({ onSubmit, error }: { onSubmit: (e: FormEvent<HTMLFormElement>) 
 }
 
 function HoverDetails({ title, rows }: { title: string; rows: Array<[string, string | number | null | undefined]> }) {
-  return <span className="hover-details" role="tooltip"><strong>{title}</strong>{rows.filter(([, value]) => value !== null && value !== undefined && value !== "").map(([label, value]) => <span key={label}><b>{label}</b><em>{String(value)}</em></span>)}</span>;
+  const anchorRef = useRef<HTMLSpanElement>(null);
+  const [placement, setPlacement] = useState<{ left: number; top: number; side: "top" | "bottom" } | null>(null);
+
+  useEffect(() => {
+    const trigger = anchorRef.current?.parentElement;
+    if (!trigger) return;
+    const show = () => {
+      const rect = trigger.getBoundingClientRect();
+      const width = 240;
+      const side = window.innerHeight - rect.bottom >= 220 ? "bottom" : "top";
+      setPlacement({
+        left: Math.min(Math.max(rect.left, 12), Math.max(12, window.innerWidth - width - 12)),
+        top: side === "bottom" ? rect.bottom + 8 : rect.top - 8,
+        side,
+      });
+    };
+    const hide = () => setPlacement(null);
+    trigger.addEventListener("mouseenter", show);
+    trigger.addEventListener("mouseleave", hide);
+    trigger.addEventListener("focusin", show);
+    trigger.addEventListener("focusout", hide);
+    window.addEventListener("scroll", hide, true);
+    window.addEventListener("resize", hide);
+    return () => {
+      trigger.removeEventListener("mouseenter", show);
+      trigger.removeEventListener("mouseleave", hide);
+      trigger.removeEventListener("focusin", show);
+      trigger.removeEventListener("focusout", hide);
+      window.removeEventListener("scroll", hide, true);
+      window.removeEventListener("resize", hide);
+    };
+  }, []);
+
+  const content = <><strong>{title}</strong>{rows.filter(([, value]) => value !== null && value !== undefined && value !== "").map(([label, value]) => <span key={label}><b>{label}</b><em>{String(value)}</em></span>)}</>;
+  return <><span ref={anchorRef} className="hover-anchor" aria-hidden="true"></span>{placement && createPortal(<span className="hover-details" role="tooltip" data-side={placement.side} style={{ left: placement.left, top: placement.top }}>{content}</span>, document.body)}</>;
 }
 
 function SecondaryPanel({ type, selected, onSelect, onCreate, onEdit, onDelete, projects, people }: { type: "projects" | "people"; selected: string | null; onSelect: (id: string | null) => void; onCreate: () => void; onEdit: (item: any) => void; onDelete: (item: any) => void; projects: typeof globalThisProjects; people: typeof globalThisPeople }) {
