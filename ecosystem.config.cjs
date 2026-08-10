@@ -1,3 +1,26 @@
+const fs = require("node:fs");
+
+function readEnvFile(filePath) {
+  try {
+    return Object.fromEntries(
+      fs
+        .readFileSync(filePath, "utf8")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith("#") && line.includes("="))
+        .map((line) => {
+          const separator = line.indexOf("=");
+          return [line.slice(0, separator), line.slice(separator + 1)];
+        }),
+    );
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    return {};
+  }
+}
+
+const cosEnv = readEnvFile("/home/ubuntu/s-pm-data/cos.env");
+
 module.exports = {
   apps: [
     {
@@ -32,10 +55,14 @@ module.exports = {
         SPM_API_PORT: "3110",
         SPM_DATA_DIR: "/home/ubuntu/s-pm-data",
         SPM_SESSION_SECRET_FILE: "/home/ubuntu/s-pm-data/session-secret",
-        TENCENT_COS_SECRET_ID: process.env.TENCENT_COS_SECRET_ID,
-        TENCENT_COS_SECRET_KEY: process.env.TENCENT_COS_SECRET_KEY,
-        TENCENT_COS_BUCKET: process.env.TENCENT_COS_BUCKET,
-        TENCENT_COS_REGION: process.env.TENCENT_COS_REGION,
+        TENCENT_COS_SECRET_ID:
+          cosEnv.TENCENT_COS_SECRET_ID || process.env.TENCENT_COS_SECRET_ID,
+        TENCENT_COS_SECRET_KEY:
+          cosEnv.TENCENT_COS_SECRET_KEY || process.env.TENCENT_COS_SECRET_KEY,
+        TENCENT_COS_BUCKET:
+          cosEnv.TENCENT_COS_BUCKET || process.env.TENCENT_COS_BUCKET,
+        TENCENT_COS_REGION:
+          cosEnv.TENCENT_COS_REGION || process.env.TENCENT_COS_REGION,
       },
     },
   ],
