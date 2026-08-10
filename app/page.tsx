@@ -48,6 +48,7 @@ export default function Home() {
   const [selectedPerson, setSelectedPerson] = useState<string | null>(null);
   const [mode, setMode] = useState<CalendarMode>("周");
   const [modal, setModal] = useState<"project" | "person" | "event" | null>(null);
+  const [editingItem, setEditingItem] = useState<any>(null);
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [toast, setToast] = useState("");
@@ -107,7 +108,7 @@ export default function Home() {
     const form = new FormData(e.currentTarget);
     const body = Object.fromEntries(form.entries());
     const endpoint = modal === "project" ? "projects" : modal === "person" ? "contacts" : "schedules";
-    const response = await fetch(`/api/${endpoint}`, { method: "POST", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const response = await fetch(`/api/${endpoint}${editingItem ? `/${editingItem.id}` : ""}`, { method: editingItem ? "PUT" : "POST", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       setToast(data.error || "保存失败");
@@ -130,15 +131,31 @@ export default function Home() {
     }
     const labels = { project: "项目", person: "人员", event: "日程" };
     await loadData();
-    setToast(`${labels[modal]}已保存`);
+    setToast(`${labels[modal]}已${editingItem ? "更新" : "保存"}`);
     setModal(null);
+    setEditingItem(null);
     window.setTimeout(() => setToast(""), 2400);
+  }
+
+  const openEditor = (type: "project" | "person" | "event", item?: any) => { setEditingItem(item || null); setModal(type); };
+
+  async function deleteRecord(type: "project" | "person" | "event", item: any) {
+    const label = type === "project" ? "项目" : type === "person" ? "人员" : "日程";
+    if (!window.confirm(`确定删除“${item.name || item.title}”吗？${type === "event" && item.attachments?.length ? " 其附件也会一并删除。" : ""}`)) return;
+    const endpoint = type === "project" ? "projects" : type === "person" ? "contacts" : "schedules";
+    const response = await fetch(`/api/${endpoint}/${item.id}`, { method: "DELETE", credentials: "include" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return notify(data.error || `删除${label}失败`);
+    if (type === "project" && selectedProject === item.id) setSelectedProject(null);
+    if (type === "person" && selectedPerson === item.id) setSelectedPerson(null);
+    setModal(null); setEditingItem(null);
+    await loadData(); notify(`${label}已删除`);
   }
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setSearchOpen(true); }
-      if (event.key === "Escape") { setSearchOpen(false); setModal(null); }
+      if (event.key === "Escape") { setSearchOpen(false); setModal(null); setEditingItem(null); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -187,7 +204,9 @@ export default function Home() {
           type={section}
           selected={section === "projects" ? selectedProject : selectedPerson}
           onSelect={section === "projects" ? setSelectedProject : setSelectedPerson}
-          onCreate={() => setModal(section === "projects" ? "project" : "person")}
+          onCreate={() => openEditor(section === "projects" ? "project" : "person")}
+          onEdit={(item) => openEditor(section === "projects" ? "project" : "person", item)}
+          onDelete={(item) => deleteRecord(section === "projects" ? "project" : "person", item)}
           projects={projectItems}
           people={peopleItems}
         />
@@ -208,7 +227,8 @@ export default function Home() {
               mode={mode}
               onMode={setMode}
               events={filteredEvents}
-              onCreate={() => setModal("event")}
+              onCreate={() => openEditor("event")}
+              onEdit={(item) => openEditor("event", item)}
               date={calendarDate}
               onDate={setCalendarDate}
             />
@@ -217,7 +237,7 @@ export default function Home() {
         </div>
       </section>
 
-      {modal && <Modal type={modal} onClose={() => setModal(null)} onSave={saveModal} projects={projectItems} people={peopleItems} />}
+      {modal && <Modal type={modal} item={editingItem} onClose={() => { setModal(null); setEditingItem(null); }} onSave={saveModal} onDelete={() => editingItem && deleteRecord(modal, editingItem)} onAttachmentDeleted={loadData} projects={projectItems} people={peopleItems} />}
       {searchOpen && <SearchOverlay query={query} setQuery={setQuery} results={searchResults} onClose={() => { setSearchOpen(false); setQuery(""); }} onWeek={() => { setSection("projects"); setSelectedProject(null); setMode("周"); setCalendarDate(new Date()); setSearchOpen(false); }} onOngoing={() => { setSection("projects"); setSelectedProject(projectItems.find(p => p.status === "进行中")?.id || null); setSearchOpen(false); }} onChoose={(item: any) => {
         if (item.type === "项目") { setSection("projects"); setSelectedProject(item.id); }
         else if (item.type === "联系人") { setSection("people"); setSelectedPerson(item.id); }
@@ -251,7 +271,11 @@ function Login({ onSubmit, error }: { onSubmit: (e: FormEvent<HTMLFormElement>) 
   </main>;
 }
 
-function SecondaryPanel({ type, selected, onSelect, onCreate, projects, people }: { type: "projects" | "people"; selected: string | null; onSelect: (id: string | null) => void; onCreate: () => void; projects: typeof globalThisProjects; people: typeof globalThisPeople }) {
+function HoverDetails({ title, rows }: { title: string; rows: Array<[string, string | number | null | undefined]> }) {
+  return <span className="hover-details" role="tooltip"><strong>{title}</strong>{rows.filter(([, value]) => value !== null && value !== undefined && value !== "").map(([label, value]) => <span key={label}><b>{label}</b><em>{String(value)}</em></span>)}</span>;
+}
+
+function SecondaryPanel({ type, selected, onSelect, onCreate, onEdit, onDelete, projects, people }: { type: "projects" | "people"; selected: string | null; onSelect: (id: string | null) => void; onCreate: () => void; onEdit: (item: any) => void; onDelete: (item: any) => void; projects: typeof globalThisProjects; people: typeof globalThisPeople }) {
   const [filter, setFilter] = useState("");
   const source = type === "projects" ? projects : people;
   const q = filter.trim().toLowerCase();
@@ -261,10 +285,14 @@ function SecondaryPanel({ type, selected, onSelect, onCreate, projects, people }
     <div className="secondary-filter"><span>⌕</span><input value={filter} onChange={e => setFilter(e.target.value)} placeholder={type === "projects" ? "筛选项目" : "筛选人员"} /></div>
     <div className="secondary-list">
       <button className={`list-all ${!selected ? "active" : ""}`} onClick={() => onSelect(null)}><span className="all-icon">⋮</span><div><strong>全部日程</strong><small>查看所有安排</small></div></button>
-      {list.map((item: any) => <button key={item.id} className={selected === item.id ? "active" : ""} onClick={() => onSelect(item.id)}>
-        {type === "projects" ? <span className="project-dot" style={{ background: item.color }}></span> : <span className={`person-avatar ${item.tone}`}>{item.name.slice(-1)}</span>}
-        <div><strong>{item.name}</strong><small>{type === "projects" ? `${item.status} · ${item.date}` : `${item.company} · ${item.role}`}</small></div><span className="chevron">›</span>
-      </button>)}
+      {list.map((item: any) => <div key={item.id} className={`secondary-item ${selected === item.id ? "active" : ""}`}>
+        <button className="secondary-main" onClick={() => onSelect(item.id)}>
+          {type === "projects" ? <span className="project-dot" style={{ background: item.color }}></span> : <span className={`person-avatar ${item.tone}`}>{item.name.slice(-1)}</span>}
+          <span className="secondary-copy"><strong>{item.name}</strong><small>{type === "projects" ? `${item.status} · ${item.date}` : `${item.company || "无公司"} · ${item.role || "无职位"}`}</small></span>
+          <HoverDetails title={item.name} rows={type === "projects" ? [["合作方", item.client], ["状态", item.status], ["日期", item.date], ["地区", item.region], ["备注", item.notes]] : [["公司", item.company], ["职位", item.role], ["电话", item.phone], ["邮箱", item.email], ["地区", item.region], ["备注", item.notes]]} />
+        </button>
+        <span className="row-actions"><button aria-label={`编辑${item.name}`} onClick={() => onEdit(item)}>✎</button><button aria-label={`删除${item.name}`} className="danger" onClick={() => onDelete(item)}>×</button></span>
+      </div>)}
       {list.length === 0 && <div className="empty-secondary">没有匹配结果</div>}
     </div>
   </aside>;
@@ -325,25 +353,26 @@ function addDate(date: Date, amount: number, unit: "day" | "week" | "month" | "y
 function dateKey(value: Date | string) { const date = value instanceof Date ? value : new Date(value); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`; }
 function mondayOf(date: Date) { const value = new Date(date); const day = value.getDay() || 7; value.setDate(value.getDate() - day + 1); value.setHours(0, 0, 0, 0); return value; }
 
-function CalendarPage({ title, subtitle, mode, onMode, events: filtered, onCreate, date, onDate }: { title: string; subtitle: string; mode: CalendarMode; onMode: (m: CalendarMode) => void; events: typeof events; onCreate: () => void; date: Date; onDate: (d: Date) => void }) {
+function CalendarPage({ title, subtitle, mode, onMode, events: filtered, onCreate, onEdit, date, onDate }: { title: string; subtitle: string; mode: CalendarMode; onMode: (m: CalendarMode) => void; events: typeof events; onCreate: () => void; onEdit: (item: any) => void; date: Date; onDate: (d: Date) => void }) {
   const unit = mode === "日" ? "day" : mode === "周" ? "week" : mode === "月" ? "month" : "year";
   const heading = mode === "年" ? `${date.getFullYear()} 年` : `${date.getFullYear()} 年 ${date.getMonth() + 1} 月`;
   return <div className="calendar-page">
     <div className="calendar-heading"><div><p>{subtitle}</p><h1>{title}</h1><span>{filtered.length} 项安排</span></div><button className="primary" onClick={onCreate}>+　新建日程</button></div>
     <section className="calendar-card">
       <div className="calendar-tools"><div className="date-nav"><button aria-label="上一段时间" onClick={() => onDate(addDate(date, -1, unit))}>‹</button><button aria-label="下一段时间" onClick={() => onDate(addDate(date, 1, unit))}>›</button><h2>{heading}</h2><button className="today" onClick={() => onDate(new Date())}>今天</button></div><div className="view-switch">{(["日", "周", "月", "年"] as CalendarMode[]).map(m => <button key={m} className={mode === m ? "active" : ""} onClick={() => onMode(m)}>{m}</button>)}</div></div>
-      {mode === "周" && <WeekView events={filtered} date={date} />}
-      {mode === "日" && <DayView events={filtered} date={date} />}
-      {mode === "月" && <MonthView events={filtered} date={date} />}
+      {mode === "周" && <WeekView events={filtered} date={date} onEdit={onEdit} />}
+      {mode === "日" && <DayView events={filtered} date={date} onEdit={onEdit} />}
+      {mode === "月" && <MonthView events={filtered} date={date} onEdit={onEdit} />}
       {mode === "年" && <YearView events={filtered} date={date} />}
     </section>
   </div>;
 }
 
 const times = ["09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00"];
-function WeekView({ events: visible, date }: { events: typeof events; date: Date }) { const monday = mondayOf(date); const days = Array.from({ length: 7 }, (_, i) => addDate(monday, i, "day")); const today = dateKey(new Date()); return <div className="week-view"><div className="week-head"><span></span>{days.map((day, i) => <div className={dateKey(day) === today ? "today-col" : ""} key={dateKey(day)}><span>周{["一","二","三","四","五","六","日"][i]}</span><strong>{day.getDate()}</strong></div>)}</div><div className="week-body"><div className="time-col">{times.map(t => <span key={t}>{t}</span>)}</div>{days.map(day => <div className={`day-col ${dateKey(day) === today ? "today-col" : ""}`} key={dateKey(day)}>{times.map(t => <i key={t}></i>)}{visible.filter((e: any) => dateKey(e.startsAt) === dateKey(day)).map((e: any) => <article key={e.id} className={`calendar-event ${e.color}`} style={{ top: `${((parseInt(e.time) - 9) * 60 + parseInt(e.time.slice(3))) * 1.15 + 6}px`, height: `${e.duration * 60 * 1.15 - 4}px` }}><strong>{e.title}</strong><span>{e.time}</span><small>{e.place}</small>{e.attachments?.length ? <small>▧ {e.attachments.length} 个附件</small> : null}</article>)}</div>)}</div></div>; }
-function DayView({ events: visible, date }: { events: typeof events; date: Date }) { const dayEvents = visible.filter((e: any) => dateKey(e.startsAt) === dateKey(date)); return <div className="day-view"><div className="day-heading"><div><span>星期{["日","一","二","三","四","五","六"][date.getDay()]}</span><strong>{date.getDate()}</strong></div><p><strong>当日安排</strong><span>{dayEvents.length} 项日程</span></p></div><div className="day-schedule">{times.map(t => <div key={t}><span>{t}</span><i></i>{dayEvents.filter((e: any) => e.time.startsWith(t.slice(0, 2))).map((e: any) => <article key={e.id} className={`calendar-event ${e.color}`}><strong>{e.title}</strong><span>{e.time} · {e.place || "未填写地点"}</span>{e.attachments?.map((a: any) => <a key={a.id} href={`/api/attachments/${a.id}/download`}>▧ {a.name}</a>)}</article>)}</div>)}</div></div>; }
-function MonthView({ events: visible, date }: { events: typeof events; date: Date }) { const first = new Date(date.getFullYear(), date.getMonth(), 1); const start = mondayOf(first); const cells = Array.from({ length: 42 }, (_, i) => addDate(start, i, "day")); const today = dateKey(new Date()); return <div className="month-view"><div className="month-weekdays">{["一", "二", "三", "四", "五", "六", "日"].map(d => <span key={d}>周{d}</span>)}</div><div className="month-grid">{cells.map(day => <div key={dateKey(day)} className={`${dateKey(day) === today ? "today-cell" : ""} ${day.getMonth() !== date.getMonth() ? "muted" : ""}`}><strong>{day.getDate()}</strong>{visible.filter((e: any) => dateKey(e.startsAt) === dateKey(day)).map((e: any) => <span className={e.color} key={e.id}>{e.title}</span>)}</div>)}</div></div>; }
+function EventHover({ event }: { event: any }) { return <HoverDetails title={event.title} rows={[["时间", `${new Date(event.startsAt).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })} — ${new Date(event.endsAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`], ["地点", event.place || "未填写"], ["备注", event.description], ["附件", event.attachments?.length ? `${event.attachments.length} 个` : "无"]]} />; }
+function WeekView({ events: visible, date, onEdit }: { events: typeof events; date: Date; onEdit: (item: any) => void }) { const monday = mondayOf(date); const days = Array.from({ length: 7 }, (_, i) => addDate(monday, i, "day")); const today = dateKey(new Date()); return <div className="week-view"><div className="week-head"><span></span>{days.map((day, i) => <div className={dateKey(day) === today ? "today-col" : ""} key={dateKey(day)}><span>周{["一","二","三","四","五","六","日"][i]}</span><strong>{day.getDate()}</strong></div>)}</div><div className="week-body"><div className="time-col">{times.map(t => <span key={t}>{t}</span>)}</div>{days.map(day => <div className={`day-col ${dateKey(day) === today ? "today-col" : ""}`} key={dateKey(day)}>{times.map(t => <i key={t}></i>)}{visible.filter((e: any) => dateKey(e.startsAt) === dateKey(day)).map((e: any) => <button key={e.id} className={`calendar-event ${e.color}`} onClick={() => onEdit(e)} style={{ top: `${((parseInt(e.time) - 9) * 60 + parseInt(e.time.slice(3))) * 1.15 + 6}px`, height: `${e.duration * 60 * 1.15 - 4}px` }}><strong>{e.title}</strong><span>{e.time}</span><small>{e.place}</small>{e.attachments?.length ? <small>▧ {e.attachments.length} 个附件</small> : null}<EventHover event={e} /></button>)}</div>)}</div></div>; }
+function DayView({ events: visible, date, onEdit }: { events: typeof events; date: Date; onEdit: (item: any) => void }) { const dayEvents = visible.filter((e: any) => dateKey(e.startsAt) === dateKey(date)); return <div className="day-view"><div className="day-heading"><div><span>星期{["日","一","二","三","四","五","六"][date.getDay()]}</span><strong>{date.getDate()}</strong></div><p><strong>当日安排</strong><span>{dayEvents.length} 项日程</span></p></div><div className="day-schedule">{times.map(t => <div key={t}><span>{t}</span><i></i>{dayEvents.filter((e: any) => e.time.startsWith(t.slice(0, 2))).map((e: any) => <button key={e.id} className={`calendar-event ${e.color}`} onClick={() => onEdit(e)}><strong>{e.title}</strong><span>{e.time} · {e.place || "未填写地点"}</span>{e.attachments?.length ? <small>▧ {e.attachments.length} 个附件</small> : null}<EventHover event={e} /></button>)}</div>)}</div></div>; }
+function MonthView({ events: visible, date, onEdit }: { events: typeof events; date: Date; onEdit: (item: any) => void }) { const first = new Date(date.getFullYear(), date.getMonth(), 1); const start = mondayOf(first); const cells = Array.from({ length: 42 }, (_, i) => addDate(start, i, "day")); const today = dateKey(new Date()); return <div className="month-view"><div className="month-weekdays">{["一", "二", "三", "四", "五", "六", "日"].map(d => <span key={d}>周{d}</span>)}</div><div className="month-grid">{cells.map(day => <div key={dateKey(day)} className={`${dateKey(day) === today ? "today-cell" : ""} ${day.getMonth() !== date.getMonth() ? "muted" : ""}`}><strong>{day.getDate()}</strong>{visible.filter((e: any) => dateKey(e.startsAt) === dateKey(day)).map((e: any) => <button className={`month-event ${e.color}`} key={e.id} onClick={() => onEdit(e)}>{e.title}<EventHover event={e} /></button>)}</div>)}</div></div>; }
 function YearView({ events: visible, date }: { events: typeof events; date: Date }) { const today = new Date(); return <div className="year-view">{Array.from({ length: 12 }, (_, month) => { const first = new Date(date.getFullYear(), month, 1); const start = mondayOf(first); const cells = Array.from({ length: 42 }, (_, i) => addDate(start, i, "day")); return <div className={today.getFullYear() === date.getFullYear() && today.getMonth() === month ? "current-month" : ""} key={month}><h3>{month + 1} 月</h3><div className="mini-week">{["一", "二", "三", "四", "五", "六", "日"].map(d => <span key={d}>{d}</span>)}</div><div className="mini-days">{cells.map(day => <i key={dateKey(day)} className={day.getMonth() === month && visible.some((e: any) => dateKey(e.startsAt) === dateKey(day)) ? "has-event" : dateKey(day) === dateKey(today) ? "today" : ""}>{day.getMonth() === month ? day.getDate() : ""}</i>)}</div></div>; })}</div>; }
 
 function Settings({ tab, onTab, profile, preferences, storage, counts, onSaved }: { tab: SettingsTab; onTab: (tab: SettingsTab) => void; profile: Profile; preferences: Preferences; storage: StorageInfo; counts: { projects: number; people: number; events: number }; onSaved: (message: string) => Promise<void> }) {
@@ -369,14 +398,16 @@ function Settings({ tab, onTab, profile, preferences, storage, counts, onSaved }
 
 function Toggle({ label, note, checked, onChange }: { label: string; note: string; checked: boolean; onChange: (value: boolean) => void }) { return <label className="toggle-row"><span><strong>{label}</strong><small>{note}</small></span><input type="checkbox" checked={checked} onChange={event => onChange(event.target.checked)} /><i></i></label>; }
 
-function Modal({ type, onClose, onSave, projects, people }: { type: "project" | "person" | "event"; onClose: () => void; onSave: (e: FormEvent<HTMLFormElement>, files?: File[]) => void; projects: typeof globalThisProjects; people: typeof globalThisPeople }) {
-  const fileRef = useRef<HTMLInputElement>(null); const [files, setFiles] = useState<File[]>([]);
-  const title = type === "project" ? "新建项目" : type === "person" ? "新建人员" : "新建日程";
+function Modal({ type, item, onClose, onSave, onDelete, onAttachmentDeleted, projects, people }: { type: "project" | "person" | "event"; item?: any; onClose: () => void; onSave: (e: FormEvent<HTMLFormElement>, files?: File[]) => void; onDelete: () => void; onAttachmentDeleted: () => Promise<void>; projects: typeof globalThisProjects; people: typeof globalThisPeople }) {
+  const fileRef = useRef<HTMLInputElement>(null); const [files, setFiles] = useState<File[]>([]); const [attachments, setAttachments] = useState<any[]>(item?.attachments || []);
+  const label = type === "project" ? "项目" : type === "person" ? "人员" : "日程";
+  const title = `${item ? "编辑" : "新建"}${label}`;
+  const removeAttachment = async (attachment: any) => { if (!window.confirm(`确定删除附件“${attachment.name}”吗？`)) return; const response = await fetch(`/api/attachments/${attachment.id}`, { method: "DELETE", credentials: "include" }); if (response.ok) { setAttachments(current => current.filter(entry => entry.id !== attachment.id)); await onAttachmentDeleted(); } else window.alert((await response.json().catch(() => ({}))).error || "附件删除失败"); };
   return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}><form className="modal" onSubmit={e => onSave(e, files)}><div className="modal-head"><div><span>{type === "event" ? "CALENDAR" : "NEW RECORD"}</span><h2>{title}</h2></div><button type="button" onClick={onClose}>×</button></div>
-    {type === "project" && <><label>项目名称<input name="name" required placeholder="例如：秋季新品发布" /></label><div className="form-row"><label>客户 / 合作方<input name="client" placeholder="输入合作方" /></label><label>项目状态<select name="status"><option>提案中</option><option>进行中</option><option>已完成</option></select></label></div><div className="form-row"><label>开始日期<input name="startDate" type="date" /></label><label>结束日期<input name="endDate" type="date" /></label></div><label>所在地区<input name="region" placeholder="上海" /></label><label>项目备注<textarea name="notes" placeholder="记录项目目标和重要信息…"></textarea></label></>}
-    {type === "person" && <><div className="form-row"><label>姓名<input name="name" required placeholder="联系人姓名" /></label><label>职位<input name="role" placeholder="品牌总监" /></label></div><label>公司 / 机构<input name="company" placeholder="所在公司" /></label><div className="form-row"><label>手机号<input name="phone" placeholder="138 0000 0000" /></label><label>所在地<input name="region" placeholder="杭州" /></label></div><label>备注<textarea name="notes" placeholder="记录彼此的合作偏好…"></textarea></label></>}
-    {type === "event" && <><label>日程标题<input name="title" required placeholder="例如：项目启动会" /></label><div className="form-row"><label>开始时间<input name="startsAt" type="datetime-local" required /></label><label>结束时间<input name="endsAt" type="datetime-local" required /></label></div><div className="form-row"><label>关联项目<select name="projectId"><option value="">请选择</option>{projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label><label>关联人员<select name="contactId"><option value="">请选择</option>{people.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label></div><label>地点<input name="location" placeholder="会议室或线上链接" /></label><label>备注<textarea name="description" placeholder="补充日程说明…"></textarea></label><div className="upload-area" onClick={() => fileRef.current?.click()}><input ref={fileRef} type="file" multiple accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx" onChange={e => setFiles(Array.from(e.target.files || []))} /><span>↑</span><div><strong>上传文件或图片</strong><small>单个文件不超过 25MB，保存日程时上传至腾讯 COS</small></div></div>{files.length > 0 && <div className="file-list">{files.map(f => <span key={`${f.name}-${f.size}`}>▧ {f.name} · {(f.size / 1024 / 1024).toFixed(1)}MB</span>)}</div>}</>}
-    <div className="modal-actions"><button type="button" onClick={onClose}>取消</button><button className="primary" type="submit">保存{type === "event" ? "日程" : ""}</button></div></form></div>;
+    {type === "project" && <><label>项目名称<input name="name" required defaultValue={item?.name || ""} placeholder="例如：秋季新品发布" /></label><div className="form-row"><label>客户 / 合作方<input name="client" defaultValue={item?.client || ""} placeholder="输入合作方" /></label><label>项目状态<select name="status" defaultValue={item?.status || "提案中"}><option>提案中</option><option>进行中</option><option>已完成</option><option>已搁置</option></select></label></div><div className="form-row"><label>开始日期<input name="startDate" type="date" defaultValue={item?.startDate || ""} /></label><label>结束日期<input name="endDate" type="date" defaultValue={item?.endDate || ""} /></label></div><label>所在地区<input name="region" defaultValue={item?.region || ""} placeholder="上海" /></label><label>项目备注<textarea name="notes" defaultValue={item?.notes || ""} placeholder="记录项目目标和重要信息…"></textarea></label></>}
+    {type === "person" && <><div className="form-row"><label>姓名<input name="name" required defaultValue={item?.name || ""} placeholder="联系人姓名" /></label><label>职位<input name="role" defaultValue={item?.role || ""} placeholder="品牌总监" /></label></div><label>公司 / 机构<input name="company" defaultValue={item?.company || ""} placeholder="所在公司" /></label><div className="form-row"><label>手机号<input name="phone" defaultValue={item?.phone || ""} placeholder="138 0000 0000" /></label><label>邮箱<input name="email" type="email" defaultValue={item?.email || ""} placeholder="name@example.com" /></label></div><label>所在地<input name="region" defaultValue={item?.region || ""} placeholder="杭州" /></label><label>备注<textarea name="notes" defaultValue={item?.notes || ""} placeholder="记录彼此的合作偏好…"></textarea></label></>}
+    {type === "event" && <><label>日程标题<input name="title" required defaultValue={item?.title || ""} placeholder="例如：项目启动会" /></label><div className="form-row"><label>开始时间<input name="startsAt" type="datetime-local" required defaultValue={item?.startsAt?.slice(0, 16) || ""} /></label><label>结束时间<input name="endsAt" type="datetime-local" required defaultValue={item?.endsAt?.slice(0, 16) || ""} /></label></div><div className="form-row"><label>关联项目<select name="projectId" defaultValue={item?.project || ""}><option value="">请选择</option>{projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label><label>关联人员<select name="contactId" defaultValue={item?.person || ""}><option value="">请选择</option>{people.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label></div><label>地点<input name="location" defaultValue={item?.place || ""} placeholder="会议室或线上链接" /></label><label>备注<textarea name="description" defaultValue={item?.description || ""} placeholder="补充日程说明…"></textarea></label>{attachments.length > 0 && <div className="existing-files"><strong>已有附件</strong>{attachments.map((attachment: any) => <span key={attachment.id}><a href={`/api/attachments/${attachment.id}/download`}>▧ {attachment.name}</a><button type="button" onClick={() => removeAttachment(attachment)}>删除</button></span>)}</div>}<div className="upload-area" onClick={() => fileRef.current?.click()}><input ref={fileRef} type="file" multiple accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx" onChange={e => setFiles(Array.from(e.target.files || []))} /><span>↑</span><div><strong>{item ? "继续添加文件或图片" : "上传文件或图片"}</strong><small>单个文件不超过 25MB，保存日程时上传至腾讯 COS</small></div></div>{files.length > 0 && <div className="file-list">{files.map(f => <span key={`${f.name}-${f.size}`}>▧ {f.name} · {(f.size / 1024 / 1024).toFixed(1)}MB</span>)}</div>}</>}
+    <div className="modal-actions">{item && <button className="delete-record" type="button" onClick={onDelete}>删除{label}</button>}<span></span><button type="button" onClick={onClose}>取消</button><button className="primary" type="submit">{item ? "保存修改" : `创建${label}`}</button></div></form></div>;
 }
 
 function SearchOverlay({ query, setQuery, results, onClose, onChoose, onWeek, onOngoing }: any) { return <div className="search-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}><div className="search-box"><div className="search-input"><span>⌕</span><input autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索项目、联系人或日程…" /><kbd onClick={onClose}>ESC</kbd></div>{query ? <div className="search-results"><p>搜索结果 · {results.length}</p>{results.length ? results.map((r: any) => <button key={`${r.type}${r.id}`} onClick={() => onChoose(r)}><span>{r.type === "项目" ? "□" : r.type === "联系人" ? "○" : "⌘"}</span><div><strong>{r.name}</strong><small>{r.type === "项目" ? `${r.client || "无合作方"} · ${r.region || "无地区"}` : r.type === "联系人" ? `${r.company || "无公司"} · ${r.role || "无职位"}` : `${r.time} · ${r.place || "未填写地点"}`}</small></div><em>{r.type}</em></button>) : <div className="empty-search">没有找到匹配内容</div>}</div> : <div className="search-suggestions"><p>快速访问</p><button onClick={onWeek}><span>⌘</span>查看本周日程</button><button onClick={onOngoing}><span>□</span>查看进行中项目</button></div>}<div className="search-foot">输入关键词后选择结果　·　ESC 关闭</div></div></div>; }

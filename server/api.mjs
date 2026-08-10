@@ -213,11 +213,39 @@ const server = createServer(async (req, res) => {
       return send(res, 201, { id: String(result.lastInsertRowid) });
     }
 
+    const projectMatch = url.pathname.match(/^\/api\/projects\/(\d+)$/);
+    if (projectMatch && req.method === "PUT") {
+      const body = await readJson(req);
+      const result = db.prepare(`UPDATE projects SET name = ?, client_name = ?, status = ?, region = ?, start_date = ?, end_date = ?, notes = ?, updated_at = datetime('now') WHERE id = ?`)
+        .run(required(body.name, "项目名称"), body.client || null, body.status || "提案中", body.region || null, body.startDate || null, body.endDate || null, body.notes || null, Number(projectMatch[1]));
+      if (!result.changes) return send(res, 404, { error: "项目不存在" });
+      return send(res, 200, { id: projectMatch[1] });
+    }
+    if (projectMatch && req.method === "DELETE") {
+      const result = db.prepare("DELETE FROM projects WHERE id = ?").run(Number(projectMatch[1]));
+      if (!result.changes) return send(res, 404, { error: "项目不存在" });
+      return send(res, 200, { ok: true });
+    }
+
     if (req.method === "POST" && url.pathname === "/api/contacts") {
       const body = await readJson(req);
       const result = db.prepare(`INSERT INTO contacts (name, company, role, phone, email, region, notes, created_by)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(required(body.name, "姓名"), body.company || null, body.role || null, body.phone || null, body.email || null, body.region || null, body.notes || null, user.id);
       return send(res, 201, { id: String(result.lastInsertRowid) });
+    }
+
+    const contactMatch = url.pathname.match(/^\/api\/contacts\/(\d+)$/);
+    if (contactMatch && req.method === "PUT") {
+      const body = await readJson(req);
+      const result = db.prepare(`UPDATE contacts SET name = ?, company = ?, role = ?, phone = ?, email = ?, region = ?, notes = ?, updated_at = datetime('now') WHERE id = ?`)
+        .run(required(body.name, "姓名"), body.company || null, body.role || null, body.phone || null, body.email || null, body.region || null, body.notes || null, Number(contactMatch[1]));
+      if (!result.changes) return send(res, 404, { error: "人员不存在" });
+      return send(res, 200, { id: contactMatch[1] });
+    }
+    if (contactMatch && req.method === "DELETE") {
+      const result = db.prepare("DELETE FROM contacts WHERE id = ?").run(Number(contactMatch[1]));
+      if (!result.changes) return send(res, 404, { error: "人员不存在" });
+      return send(res, 200, { ok: true });
     }
 
     if (req.method === "POST" && url.pathname === "/api/schedules") {
@@ -234,6 +262,35 @@ const server = createServer(async (req, res) => {
         db.exec("COMMIT");
         return send(res, 201, { id: String(id) });
       } catch (error) { db.exec("ROLLBACK"); throw error; }
+    }
+
+    const scheduleMatch = url.pathname.match(/^\/api\/schedules\/(\d+)$/);
+    if (scheduleMatch && req.method === "PUT") {
+      const scheduleId = Number(scheduleMatch[1]);
+      const body = await readJson(req);
+      if (!db.prepare("SELECT id FROM schedules WHERE id = ?").get(scheduleId)) return send(res, 404, { error: "日程不存在" });
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.prepare(`UPDATE schedules SET title = ?, description = ?, location = ?, starts_at = ?, ends_at = ?, updated_at = datetime('now') WHERE id = ?`)
+          .run(required(body.title, "日程标题"), body.description || null, body.location || null, required(body.startsAt, "开始时间"), required(body.endsAt, "结束时间"), scheduleId);
+        db.prepare("DELETE FROM schedule_projects WHERE schedule_id = ?").run(scheduleId);
+        db.prepare("DELETE FROM schedule_contacts WHERE schedule_id = ?").run(scheduleId);
+        if (body.projectId) db.prepare("INSERT INTO schedule_projects (schedule_id, project_id) VALUES (?, ?)").run(scheduleId, body.projectId);
+        if (body.contactId) db.prepare("INSERT INTO schedule_contacts (schedule_id, contact_id) VALUES (?, ?)").run(scheduleId, body.contactId);
+        db.exec("COMMIT");
+        return send(res, 200, { id: scheduleMatch[1] });
+      } catch (error) { db.exec("ROLLBACK"); throw error; }
+    }
+    if (scheduleMatch && req.method === "DELETE") {
+      const scheduleId = Number(scheduleMatch[1]);
+      if (!db.prepare("SELECT id FROM schedules WHERE id = ?").get(scheduleId)) return send(res, 404, { error: "日程不存在" });
+      const attachments = db.prepare("SELECT object_key FROM attachments WHERE schedule_id = ?").all(scheduleId);
+      if (attachments.length && !cos) return send(res, 503, { error: "腾讯 COS 尚未完成配置，无法删除日程附件" });
+      for (const attachment of attachments) {
+        await cos.deleteObject({ Bucket: cosConfig.bucket, Region: cosConfig.region, Key: attachment.object_key });
+      }
+      db.prepare("DELETE FROM schedules WHERE id = ?").run(scheduleId);
+      return send(res, 200, { ok: true });
     }
 
     const uploadMatch = url.pathname.match(/^\/api\/schedules\/(\d+)\/attachments$/);
@@ -260,6 +317,16 @@ const server = createServer(async (req, res) => {
       const signedUrl = cos.getObjectUrl({ Bucket: cosConfig.bucket, Region: cosConfig.region, Key: attachment.object_key, Sign: true, Method: "GET", Expires: 300, Protocol: "https:" });
       res.writeHead(302, { location: signedUrl, "cache-control": "no-store" });
       return res.end();
+    }
+
+    const attachmentMatch = url.pathname.match(/^\/api\/attachments\/(\d+)$/);
+    if (req.method === "DELETE" && attachmentMatch) {
+      if (!cos) return send(res, 503, { error: "腾讯 COS 尚未完成配置" });
+      const attachment = db.prepare("SELECT object_key FROM attachments WHERE id = ?").get(Number(attachmentMatch[1]));
+      if (!attachment) return send(res, 404, { error: "附件不存在" });
+      await cos.deleteObject({ Bucket: cosConfig.bucket, Region: cosConfig.region, Key: attachment.object_key });
+      db.prepare("DELETE FROM attachments WHERE id = ?").run(Number(attachmentMatch[1]));
+      return send(res, 200, { ok: true });
     }
 
     return send(res, 404, { error: "未找到接口" });
