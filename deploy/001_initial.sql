@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE TABLE IF NOT EXISTS projects (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  parent_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
   name TEXT NOT NULL,
   client_name TEXT,
   status TEXT NOT NULL DEFAULT '提案中' CHECK (status IN ('提案中', '进行中', '已完成', '已搁置')),
@@ -21,10 +22,12 @@ CREATE TABLE IF NOT EXISTS projects (
   end_date TEXT,
   notes TEXT,
   color TEXT NOT NULL DEFAULT '#ff735f',
+  tags TEXT NOT NULL DEFAULT '[]',
   created_by INTEGER REFERENCES users(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-  deleted_at TEXT
+  deleted_at TEXT,
+  deleted_group TEXT
 );
 
 CREATE TABLE IF NOT EXISTS contacts (
@@ -36,6 +39,7 @@ CREATE TABLE IF NOT EXISTS contacts (
   email TEXT,
   region TEXT,
   notes TEXT,
+  tags TEXT NOT NULL DEFAULT '[]',
   created_by INTEGER REFERENCES users(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -88,6 +92,31 @@ CREATE TABLE IF NOT EXISTS attachments (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  due_date TEXT,
+  status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('todo', 'done')),
+  assignee_contact_id INTEGER REFERENCES contacts(id) ON DELETE SET NULL,
+  is_milestone INTEGER NOT NULL DEFAULT 0 CHECK (is_milestone IN (0, 1)),
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS activity_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_type TEXT NOT NULL,
+  entity_id INTEGER,
+  action TEXT NOT NULL,
+  entity_name TEXT NOT NULL,
+  details TEXT,
+  user_id INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS user_settings (
   user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   schedule_reminders INTEGER NOT NULL DEFAULT 1,
@@ -105,3 +134,8 @@ CREATE INDEX IF NOT EXISTS idx_projects_deleted_at ON projects(deleted_at) WHERE
 CREATE INDEX IF NOT EXISTS idx_contacts_deleted_at ON contacts(deleted_at) WHERE deleted_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_schedules_deleted_at ON schedules(deleted_at) WHERE deleted_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_attachments_deleted_at ON attachments(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_projects_parent_id ON projects(parent_id) WHERE parent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date) WHERE deleted_at IS NULL AND status = 'todo';
+CREATE INDEX IF NOT EXISTS idx_tasks_deleted_at ON tasks(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_activity_entity_created ON activity_logs(entity_type, entity_id, created_at DESC);

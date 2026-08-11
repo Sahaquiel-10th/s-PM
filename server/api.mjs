@@ -21,11 +21,43 @@ function ensureColumn(table, column, definition) {
 for (const table of ["projects", "contacts", "schedules", "attachments"]) {
   ensureColumn(table, "deleted_at", "TEXT");
 }
+ensureColumn("projects", "parent_id", "INTEGER REFERENCES projects(id) ON DELETE SET NULL");
+ensureColumn("projects", "tags", "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn("projects", "deleted_group", "TEXT");
+ensureColumn("contacts", "tags", "TEXT NOT NULL DEFAULT '[]'");
+db.exec(`CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  due_date TEXT,
+  status TEXT NOT NULL DEFAULT 'todo' CHECK (status IN ('todo', 'done')),
+  assignee_contact_id INTEGER REFERENCES contacts(id) ON DELETE SET NULL,
+  is_milestone INTEGER NOT NULL DEFAULT 0 CHECK (is_milestone IN (0, 1)),
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT
+);
+CREATE TABLE IF NOT EXISTS activity_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_type TEXT NOT NULL,
+  entity_id INTEGER,
+  action TEXT NOT NULL,
+  entity_name TEXT NOT NULL,
+  details TEXT,
+  user_id INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);`);
 db.exec(`
   CREATE INDEX IF NOT EXISTS idx_projects_deleted_at ON projects(deleted_at) WHERE deleted_at IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_contacts_deleted_at ON contacts(deleted_at) WHERE deleted_at IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_schedules_deleted_at ON schedules(deleted_at) WHERE deleted_at IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_attachments_deleted_at ON attachments(deleted_at) WHERE deleted_at IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_projects_parent_id ON projects(parent_id) WHERE parent_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status) WHERE deleted_at IS NULL;
+  CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date) WHERE deleted_at IS NULL AND status = 'todo';
+  CREATE INDEX IF NOT EXISTS idx_tasks_deleted_at ON tasks(deleted_at) WHERE deleted_at IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_activity_entity_created ON activity_logs(entity_type, entity_id, created_at DESC);
   PRAGMA optimize;
 `);
 db.exec(`CREATE TABLE IF NOT EXISTS user_settings (
@@ -109,18 +141,51 @@ function verifyPassword(password, stored) {
   return actual.length === expected.length && timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
 }
 
+function parseTags(value) {
+  const source = Array.isArray(value) ? value : String(value || "").split(/[,，]/);
+  return [...new Set(source.map(tag => String(tag).trim()).filter(Boolean))].slice(0, 12);
+}
+
+function readTags(value) {
+  try { return parseTags(JSON.parse(String(value || "[]"))); } catch { return parseTags(value); }
+}
+
+function parseIds(value) {
+  return [...new Set((Array.isArray(value) ? value : value ? [value] : []).map(Number).filter(Number.isInteger))];
+}
+
+function logActivity(userId, entityType, entityId, action, entityName, details = null) {
+  db.prepare(`INSERT INTO activity_logs (entity_type, entity_id, action, entity_name, details, user_id)
+    VALUES (?, ?, ?, ?, ?, ?)`).run(entityType, entityId || null, action, entityName, details, userId);
+}
+
+function setProjectContacts(projectId, contactIds) {
+  db.prepare("DELETE FROM project_contacts WHERE project_id = ?").run(projectId);
+  const insert = db.prepare("INSERT OR IGNORE INTO project_contacts (project_id, contact_id) VALUES (?, ?)");
+  for (const contactId of parseIds(contactIds)) {
+    if (db.prepare("SELECT id FROM contacts WHERE id = ? AND deleted_at IS NULL").get(contactId)) insert.run(projectId, contactId);
+  }
+}
+
 function projectRows() {
-  return db.prepare(`SELECT id, name, client_name AS client, status, region, start_date AS startDate,
-    end_date AS endDate, notes, color, COALESCE(substr(start_date, 6), '') || CASE WHEN end_date IS NULL THEN '' ELSE '—' || substr(end_date, 6) END AS date
-    FROM projects WHERE deleted_at IS NULL ORDER BY created_at DESC`).all().map(row => ({ ...row, id: String(row.id) }));
+  const rows = db.prepare(`SELECT p.id, p.parent_id AS parentId, parent.name AS parentName, p.name, p.client_name AS client,
+    p.status, p.region, p.start_date AS startDate, p.end_date AS endDate, p.notes, p.color, p.tags,
+    COALESCE(substr(p.start_date, 6), '') || CASE WHEN p.end_date IS NULL THEN '' ELSE '—' || substr(p.end_date, 6) END AS date
+    FROM projects p LEFT JOIN projects parent ON parent.id = p.parent_id
+    WHERE p.deleted_at IS NULL ORDER BY CASE WHEN p.parent_id IS NULL THEN p.created_at ELSE parent.created_at END DESC, p.parent_id, p.created_at`).all();
+  const contacts = db.prepare("SELECT contact_id FROM project_contacts WHERE project_id = ? ORDER BY contact_id");
+  return rows.map(row => ({ ...row, id: String(row.id), parentId: row.parentId == null ? null : String(row.parentId), tags: readTags(row.tags), contactIds: contacts.all(row.id).map(entry => String(entry.contact_id)) }));
 }
 
 function contactRows() {
-  return db.prepare(`SELECT c.id, c.name, c.company, c.role, c.phone, c.email, c.region, c.notes,
+  const rows = db.prepare(`SELECT c.id, c.name, c.company, c.role, c.phone, c.email, c.region, c.notes, c.tags,
     COUNT(CASE WHEN p.deleted_at IS NULL THEN pc.project_id END) AS count FROM contacts c
     LEFT JOIN project_contacts pc ON pc.contact_id = c.id
     LEFT JOIN projects p ON p.id = pc.project_id
-    WHERE c.deleted_at IS NULL GROUP BY c.id ORDER BY count DESC, c.created_at DESC`).all().map((row, index) => ({ ...row, id: String(row.id), tone: tones[index % tones.length] }));
+    WHERE c.deleted_at IS NULL GROUP BY c.id ORDER BY count DESC, c.created_at DESC`).all();
+  const projects = db.prepare(`SELECT pc.project_id FROM project_contacts pc JOIN projects p ON p.id = pc.project_id
+    WHERE pc.contact_id = ? AND p.deleted_at IS NULL ORDER BY p.created_at DESC`);
+  return rows.map((row, index) => ({ ...row, id: String(row.id), tags: readTags(row.tags), projectIds: projects.all(row.id).map(entry => String(entry.project_id)), tone: tones[index % tones.length] }));
 }
 
 function scheduleRows() {
@@ -137,10 +202,30 @@ function scheduleRows() {
     });
 }
 
+function taskRows() {
+  return db.prepare(`SELECT t.id, t.project_id AS projectId, t.title, t.due_date AS dueDate, t.status,
+    t.assignee_contact_id AS assigneeId, t.is_milestone AS isMilestone, c.name AS assigneeName
+    FROM tasks t JOIN projects p ON p.id = t.project_id LEFT JOIN contacts c ON c.id = t.assignee_contact_id AND c.deleted_at IS NULL
+    WHERE t.deleted_at IS NULL AND p.deleted_at IS NULL ORDER BY t.status, t.is_milestone DESC, COALESCE(t.due_date, '9999-12-31'), t.created_at DESC`).all()
+    .map(row => ({ ...row, id: String(row.id), projectId: String(row.projectId), assigneeId: row.assigneeId == null ? null : String(row.assigneeId), isMilestone: Boolean(row.isMilestone) }));
+}
+
+function activityRows() {
+  return db.prepare(`SELECT id, entity_type AS entityType, entity_id AS entityId, action, entity_name AS entityName,
+    details, created_at AS createdAt FROM activity_logs ORDER BY created_at DESC, id DESC LIMIT 120`).all()
+    .map(row => ({ ...row, id: String(row.id), entityId: row.entityId == null ? null : String(row.entityId) }));
+}
+
 function trashRows() {
   return [
-    ...db.prepare(`SELECT id, 'project' AS type, '项目' AS label, name, COALESCE(client_name, status, '') AS summary, deleted_at AS deletedAt
-      FROM projects WHERE deleted_at IS NOT NULL`).all(),
+    ...db.prepare(`SELECT p.id, 'project' AS type, CASE WHEN p.parent_id IS NULL THEN '项目' ELSE '子项目' END AS label,
+      p.name, COALESCE(p.client_name, p.status, '') || CASE WHEN child.total > 0 THEN ' · 含 ' || child.total || ' 个子项目' ELSE '' END AS summary,
+      p.deleted_at AS deletedAt FROM projects p
+      LEFT JOIN (SELECT parent_id, deleted_group, COUNT(*) AS total FROM projects WHERE deleted_at IS NOT NULL GROUP BY parent_id, deleted_group) child
+        ON child.parent_id = p.id AND child.deleted_group = p.deleted_group
+      WHERE p.deleted_at IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM projects parent WHERE parent.id = p.parent_id AND parent.deleted_at IS NOT NULL AND parent.deleted_group = p.deleted_group
+      )`).all(),
     ...db.prepare(`SELECT id, 'contact' AS type, '人员' AS label, name, COALESCE(company, role, '') AS summary, deleted_at AS deletedAt
       FROM contacts WHERE deleted_at IS NOT NULL`).all(),
     ...db.prepare(`SELECT id, 'schedule' AS type, '日程' AS label, title AS name, COALESCE(location, starts_at, '') AS summary, deleted_at AS deletedAt
@@ -148,6 +233,9 @@ function trashRows() {
     ...db.prepare(`SELECT a.id, 'attachment' AS type, '附件' AS label, a.original_name AS name,
       COALESCE(s.title, '所属日程不存在') AS summary, a.deleted_at AS deletedAt
       FROM attachments a LEFT JOIN schedules s ON s.id = a.schedule_id WHERE a.deleted_at IS NOT NULL`).all(),
+    ...db.prepare(`SELECT t.id, 'task' AS type, CASE WHEN t.is_milestone = 1 THEN '里程碑' ELSE '待办' END AS label,
+      t.title AS name, COALESCE(p.name, '所属项目不存在') AS summary, t.deleted_at AS deletedAt
+      FROM tasks t LEFT JOIN projects p ON p.id = t.project_id WHERE t.deleted_at IS NOT NULL`).all(),
   ].map(row => ({ ...row, id: String(row.id) })).sort((a, b) => String(b.deletedAt).localeCompare(String(a.deletedAt)));
 }
 
@@ -161,14 +249,22 @@ function bootstrap(userId) {
   const projects = projectRows();
   const people = contactRows();
   const events = scheduleRows();
+  const tasks = taskRows();
+  const activities = activityRows();
   const profile = db.prepare("SELECT username, display_name AS displayName, email FROM users WHERE id = ?").get(userId);
-  return { projects, people, events, trash: trashRows(), profile, preferences: settingsFor(userId), storage: { provider: "腾讯云 COS", configured: cosConfigured, bucket: cosConfigured ? cosConfig.bucket : null, region: cosConfigured ? cosConfig.region : null } };
+  return { projects, people, events, tasks, activities, trash: trashRows(), profile, preferences: settingsFor(userId), storage: { provider: "腾讯云 COS", configured: cosConfigured, bucket: cosConfigured ? cosConfig.bucket : null, region: cosConfigured ? cosConfig.region : null } };
 }
 
 function required(value, label) {
   const text = String(value || "").trim();
   if (!text) throw new Error(`${label}不能为空`);
   return text;
+}
+
+function validateDateWindow(startsAt, endsAt) {
+  const start = new Date(startsAt).getTime();
+  const end = new Date(endsAt).getTime();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) throw new Error("结束时间必须晚于开始时间");
 }
 
 const server = createServer(async (req, res) => {
@@ -202,12 +298,19 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/bootstrap") return send(res, 200, bootstrap(user.id));
     if (req.method === "GET" && url.pathname === "/api/trash") return send(res, 200, { items: trashRows() });
 
-    const restoreMatch = url.pathname.match(/^\/api\/trash\/(project|contact|schedule|attachment)\/(\d+)\/restore$/);
+    const restoreMatch = url.pathname.match(/^\/api\/trash\/(project|contact|schedule|attachment|task)\/(\d+)\/restore$/);
     if (restoreMatch && req.method === "POST") {
-      const tables = { project: "projects", contact: "contacts", schedule: "schedules", attachment: "attachments" };
-      const table = tables[restoreMatch[1]];
-      const result = db.prepare(`UPDATE ${table} SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL`).run(Number(restoreMatch[2]));
+      const type = restoreMatch[1];
+      const tables = { project: "projects", contact: "contacts", schedule: "schedules", attachment: "attachments", task: "tasks" };
+      const table = tables[type];
+      const names = { project: "name", contact: "name", schedule: "title", attachment: "original_name", task: "title" };
+      const record = db.prepare(`SELECT ${names[type]} AS name${type === "project" ? ", deleted_group AS deletedGroup" : ""} FROM ${table} WHERE id = ? AND deleted_at IS NOT NULL`).get(Number(restoreMatch[2]));
+      if (!record) return send(res, 404, { error: "回收站中未找到该记录" });
+      const result = type === "project" && record.deletedGroup
+        ? db.prepare("UPDATE projects SET deleted_at = NULL, deleted_group = NULL WHERE deleted_group = ?").run(record.deletedGroup)
+        : db.prepare(`UPDATE ${table} SET deleted_at = NULL${type === "project" ? ", deleted_group = NULL" : ""} WHERE id = ? AND deleted_at IS NOT NULL`).run(Number(restoreMatch[2]));
       if (!result.changes) return send(res, 404, { error: "回收站中未找到该记录" });
+      logActivity(user.id, type, Number(restoreMatch[2]), "恢复", record.name, type === "project" && result.changes > 1 ? `同时恢复 ${result.changes - 1} 个子项目` : null);
       return send(res, 200, { ok: true });
     }
 
@@ -251,43 +354,77 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/projects") {
       const body = await readJson(req);
-      const result = db.prepare(`INSERT INTO projects (name, client_name, status, region, start_date, end_date, notes, color, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(required(body.name, "项目名称"), body.client || null, body.status || "提案中", body.region || null, body.startDate || null, body.endDate || null, body.notes || null, body.color || "#ff735f", user.id);
-      return send(res, 201, { id: String(result.lastInsertRowid) });
+      const name = required(body.name, "项目名称");
+      const parentId = body.parentId ? Number(body.parentId) : null;
+      const parent = parentId ? db.prepare("SELECT * FROM projects WHERE id = ? AND parent_id IS NULL AND deleted_at IS NULL").get(parentId) : null;
+      if (parentId && !parent) return send(res, 400, { error: "父项目不存在或不能继续嵌套" });
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const result = db.prepare(`INSERT INTO projects (parent_id, name, client_name, status, region, start_date, end_date, notes, color, tags, created_by)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(parentId, name, body.client || parent?.client_name || null, body.status || "提案中", body.region || parent?.region || null, body.startDate || null, body.endDate || null, body.notes || null, body.color || parent?.color || "#ff735f", JSON.stringify(parseTags(body.tags)), user.id);
+        const id = Number(result.lastInsertRowid);
+        const inheritedContacts = parentId && !Array.isArray(body.contactIds)
+          ? db.prepare("SELECT contact_id FROM project_contacts WHERE project_id = ?").all(parentId).map(row => row.contact_id)
+          : body.contactIds;
+        setProjectContacts(id, inheritedContacts);
+        logActivity(user.id, "project", id, parentId ? "创建子项目" : "创建", name, parent?.name || null);
+        db.exec("COMMIT");
+        return send(res, 201, { id: String(id) });
+      } catch (error) { db.exec("ROLLBACK"); throw error; }
     }
 
     const projectMatch = url.pathname.match(/^\/api\/projects\/(\d+)$/);
     if (projectMatch && req.method === "PUT") {
       const body = await readJson(req);
-      const result = db.prepare(`UPDATE projects SET name = ?, client_name = ?, status = ?, region = ?, start_date = ?, end_date = ?, notes = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`)
-        .run(required(body.name, "项目名称"), body.client || null, body.status || "提案中", body.region || null, body.startDate || null, body.endDate || null, body.notes || null, Number(projectMatch[1]));
-      if (!result.changes) return send(res, 404, { error: "项目不存在" });
-      return send(res, 200, { id: projectMatch[1] });
+      const projectId = Number(projectMatch[1]);
+      const name = required(body.name, "项目名称");
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const result = db.prepare(`UPDATE projects SET name = ?, client_name = ?, status = ?, region = ?, start_date = ?, end_date = ?, notes = ?, tags = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`)
+          .run(name, body.client || null, body.status || "提案中", body.region || null, body.startDate || null, body.endDate || null, body.notes || null, JSON.stringify(parseTags(body.tags)), projectId);
+        if (!result.changes) { db.exec("ROLLBACK"); return send(res, 404, { error: "项目不存在" }); }
+        setProjectContacts(projectId, body.contactIds);
+        logActivity(user.id, "project", projectId, "更新", name);
+        db.exec("COMMIT");
+        return send(res, 200, { id: projectMatch[1] });
+      } catch (error) { db.exec("ROLLBACK"); throw error; }
     }
     if (projectMatch && req.method === "DELETE") {
-      const result = db.prepare("UPDATE projects SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL").run(Number(projectMatch[1]));
-      if (!result.changes) return send(res, 404, { error: "项目不存在" });
+      const projectId = Number(projectMatch[1]);
+      const project = db.prepare("SELECT id, name, parent_id AS parentId FROM projects WHERE id = ? AND deleted_at IS NULL").get(projectId);
+      if (!project) return send(res, 404, { error: "项目不存在" });
+      const group = randomBytes(12).toString("hex");
+      const result = project.parentId == null
+        ? db.prepare("UPDATE projects SET deleted_at = datetime('now'), deleted_group = ?, updated_at = datetime('now') WHERE (id = ? OR parent_id = ?) AND deleted_at IS NULL").run(group, projectId, projectId)
+        : db.prepare("UPDATE projects SET deleted_at = datetime('now'), deleted_group = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL").run(group, projectId);
+      logActivity(user.id, "project", projectId, "移入回收站", project.name, result.changes > 1 ? `包含 ${result.changes - 1} 个子项目` : null);
       return send(res, 200, { ok: true });
     }
 
     if (req.method === "POST" && url.pathname === "/api/contacts") {
       const body = await readJson(req);
-      const result = db.prepare(`INSERT INTO contacts (name, company, role, phone, email, region, notes, created_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(required(body.name, "姓名"), body.company || null, body.role || null, body.phone || null, body.email || null, body.region || null, body.notes || null, user.id);
+      const name = required(body.name, "姓名");
+      const result = db.prepare(`INSERT INTO contacts (name, company, role, phone, email, region, notes, tags, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(name, body.company || null, body.role || null, body.phone || null, body.email || null, body.region || null, body.notes || null, JSON.stringify(parseTags(body.tags)), user.id);
+      logActivity(user.id, "contact", Number(result.lastInsertRowid), "创建", name);
       return send(res, 201, { id: String(result.lastInsertRowid) });
     }
 
     const contactMatch = url.pathname.match(/^\/api\/contacts\/(\d+)$/);
     if (contactMatch && req.method === "PUT") {
       const body = await readJson(req);
-      const result = db.prepare(`UPDATE contacts SET name = ?, company = ?, role = ?, phone = ?, email = ?, region = ?, notes = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`)
-        .run(required(body.name, "姓名"), body.company || null, body.role || null, body.phone || null, body.email || null, body.region || null, body.notes || null, Number(contactMatch[1]));
+      const name = required(body.name, "姓名");
+      const result = db.prepare(`UPDATE contacts SET name = ?, company = ?, role = ?, phone = ?, email = ?, region = ?, notes = ?, tags = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`)
+        .run(name, body.company || null, body.role || null, body.phone || null, body.email || null, body.region || null, body.notes || null, JSON.stringify(parseTags(body.tags)), Number(contactMatch[1]));
       if (!result.changes) return send(res, 404, { error: "人员不存在" });
+      logActivity(user.id, "contact", Number(contactMatch[1]), "更新", name);
       return send(res, 200, { id: contactMatch[1] });
     }
     if (contactMatch && req.method === "DELETE") {
+      const contact = db.prepare("SELECT name FROM contacts WHERE id = ? AND deleted_at IS NULL").get(Number(contactMatch[1]));
       const result = db.prepare("UPDATE contacts SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL").run(Number(contactMatch[1]));
       if (!result.changes) return send(res, 404, { error: "人员不存在" });
+      logActivity(user.id, "contact", Number(contactMatch[1]), "移入回收站", contact.name);
       return send(res, 200, { ok: true });
     }
 
@@ -295,13 +432,16 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       const startsAt = required(body.startsAt, "开始时间");
       const endsAt = required(body.endsAt, "结束时间");
+      validateDateWindow(startsAt, endsAt);
       db.exec("BEGIN IMMEDIATE");
       try {
+        const title = required(body.title, "日程标题");
         const result = db.prepare(`INSERT INTO schedules (title, description, location, starts_at, ends_at, created_by) VALUES (?, ?, ?, ?, ?, ?)`)
-          .run(required(body.title, "日程标题"), body.description || null, body.location || null, startsAt, endsAt, user.id);
+          .run(title, body.description || null, body.location || null, startsAt, endsAt, user.id);
         const id = result.lastInsertRowid;
         if (body.projectId) db.prepare("INSERT INTO schedule_projects (schedule_id, project_id) VALUES (?, ?)").run(id, body.projectId);
         if (body.contactId) db.prepare("INSERT INTO schedule_contacts (schedule_id, contact_id) VALUES (?, ?)").run(id, body.contactId);
+        logActivity(user.id, "schedule", Number(id), "创建", title, startsAt);
         db.exec("COMMIT");
         return send(res, 201, { id: String(id) });
       } catch (error) { db.exec("ROLLBACK"); throw error; }
@@ -314,20 +454,75 @@ const server = createServer(async (req, res) => {
       if (!db.prepare("SELECT id FROM schedules WHERE id = ? AND deleted_at IS NULL").get(scheduleId)) return send(res, 404, { error: "日程不存在" });
       db.exec("BEGIN IMMEDIATE");
       try {
+        const title = required(body.title, "日程标题");
+        const startsAt = required(body.startsAt, "开始时间");
+        const endsAt = required(body.endsAt, "结束时间");
+        validateDateWindow(startsAt, endsAt);
         db.prepare(`UPDATE schedules SET title = ?, description = ?, location = ?, starts_at = ?, ends_at = ?, updated_at = datetime('now') WHERE id = ?`)
-          .run(required(body.title, "日程标题"), body.description || null, body.location || null, required(body.startsAt, "开始时间"), required(body.endsAt, "结束时间"), scheduleId);
+          .run(title, body.description || null, body.location || null, startsAt, endsAt, scheduleId);
         db.prepare("DELETE FROM schedule_projects WHERE schedule_id = ?").run(scheduleId);
         db.prepare("DELETE FROM schedule_contacts WHERE schedule_id = ?").run(scheduleId);
         if (body.projectId) db.prepare("INSERT INTO schedule_projects (schedule_id, project_id) VALUES (?, ?)").run(scheduleId, body.projectId);
         if (body.contactId) db.prepare("INSERT INTO schedule_contacts (schedule_id, contact_id) VALUES (?, ?)").run(scheduleId, body.contactId);
+        logActivity(user.id, "schedule", scheduleId, "更新", title);
         db.exec("COMMIT");
         return send(res, 200, { id: scheduleMatch[1] });
       } catch (error) { db.exec("ROLLBACK"); throw error; }
     }
     if (scheduleMatch && req.method === "DELETE") {
       const scheduleId = Number(scheduleMatch[1]);
+      const schedule = db.prepare("SELECT title FROM schedules WHERE id = ? AND deleted_at IS NULL").get(scheduleId);
       const result = db.prepare("UPDATE schedules SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL").run(scheduleId);
       if (!result.changes) return send(res, 404, { error: "日程不存在" });
+      logActivity(user.id, "schedule", scheduleId, "移入回收站", schedule.title);
+      return send(res, 200, { ok: true });
+    }
+
+    const moveScheduleMatch = url.pathname.match(/^\/api\/schedules\/(\d+)\/move$/);
+    if (moveScheduleMatch && req.method === "PATCH") {
+      const scheduleId = Number(moveScheduleMatch[1]);
+      const body = await readJson(req);
+      const schedule = db.prepare("SELECT title FROM schedules WHERE id = ? AND deleted_at IS NULL").get(scheduleId);
+      if (!schedule) return send(res, 404, { error: "日程不存在" });
+      const startsAt = required(body.startsAt, "开始时间");
+      const endsAt = required(body.endsAt, "结束时间");
+      validateDateWindow(startsAt, endsAt);
+      db.prepare("UPDATE schedules SET starts_at = ?, ends_at = ?, updated_at = datetime('now') WHERE id = ?").run(startsAt, endsAt, scheduleId);
+      logActivity(user.id, "schedule", scheduleId, "拖动改期", schedule.title, startsAt);
+      return send(res, 200, { ok: true });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/tasks") {
+      const body = await readJson(req);
+      const projectId = Number(body.projectId);
+      const project = db.prepare("SELECT name FROM projects WHERE id = ? AND deleted_at IS NULL").get(projectId);
+      if (!project) return send(res, 400, { error: "请选择有效项目" });
+      const title = required(body.title, "待办内容");
+      const assigneeId = body.assigneeId ? Number(body.assigneeId) : null;
+      const result = db.prepare(`INSERT INTO tasks (project_id, title, due_date, status, assignee_contact_id, is_milestone, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(projectId, title, body.dueDate || null, body.status === "done" ? "done" : "todo", assigneeId, body.isMilestone ? 1 : 0, user.id);
+      logActivity(user.id, "project", projectId, body.isMilestone ? "添加里程碑" : "添加待办", project.name, title);
+      return send(res, 201, { id: String(result.lastInsertRowid) });
+    }
+
+    const taskMatch = url.pathname.match(/^\/api\/tasks\/(\d+)$/);
+    if (taskMatch && req.method === "PUT") {
+      const taskId = Number(taskMatch[1]);
+      const body = await readJson(req);
+      const current = db.prepare("SELECT project_id AS projectId, title FROM tasks WHERE id = ? AND deleted_at IS NULL").get(taskId);
+      if (!current) return send(res, 404, { error: "待办不存在" });
+      const title = required(body.title, "待办内容");
+      db.prepare(`UPDATE tasks SET title = ?, due_date = ?, status = ?, assignee_contact_id = ?, is_milestone = ?, updated_at = datetime('now')
+        WHERE id = ?`).run(title, body.dueDate || null, body.status === "done" ? "done" : "todo", body.assigneeId ? Number(body.assigneeId) : null, body.isMilestone ? 1 : 0, taskId);
+      logActivity(user.id, "project", current.projectId, body.status === "done" ? "完成待办" : "更新待办", title);
+      return send(res, 200, { ok: true });
+    }
+    if (taskMatch && req.method === "DELETE") {
+      const taskId = Number(taskMatch[1]);
+      const task = db.prepare("SELECT project_id AS projectId, title FROM tasks WHERE id = ? AND deleted_at IS NULL").get(taskId);
+      if (!task) return send(res, 404, { error: "待办不存在" });
+      db.prepare("UPDATE tasks SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").run(taskId);
+      logActivity(user.id, "project", task.projectId, "删除待办", task.title);
       return send(res, 200, { ok: true });
     }
 
@@ -368,7 +563,7 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     console.error(error);
     const message = error instanceof Error ? error.message : "服务器错误";
-    return send(res, message.includes("不能为空") ? 400 : 500, { error: message });
+    return send(res, message.includes("不能为空") || message.includes("必须") ? 400 : 500, { error: message });
   }
 });
 

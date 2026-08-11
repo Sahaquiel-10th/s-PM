@@ -34,7 +34,7 @@ test("projects, contacts, schedules and attachments expose edit and recoverable 
   assert.match(page, /method: "DELETE"/);
   assert.match(page, /移入回收站/);
   assert.match(page, /function restoreRecord/);
-  assert.match(page, /const title = `\$\{item \? "编辑" : "新建"\}\$\{label\}`/);
+  assert.match(page, /const title = `\$\{item \? "编辑" : "新建"\}\$\{isChildProject \? "子项目" : label\}`/);
 
   for (const resource of ["projects", "contacts", "schedules"]) {
     assert.match(api, new RegExp(`const ${resource.slice(0, -1)}Match = url\\.pathname\\.match\\(\\/\\^\\\\\\/api\\\\\\/${resource}`));
@@ -51,6 +51,32 @@ test("projects, contacts, schedules and attachments expose edit and recoverable 
   assert.doesNotMatch(api, /DELETE FROM projects WHERE id/);
   assert.doesNotMatch(api, /DELETE FROM contacts WHERE id/);
   assert.doesNotMatch(api, /DELETE FROM schedules WHERE id/);
+});
+
+test("project productivity tools cover hierarchy, relations, tasks, history and calendar moves", async () => {
+  const [page, api, schema] = await Promise.all([
+    readFile(new URL("app/page.tsx", root), "utf8"),
+    readFile(new URL("server/api.mjs", root), "utf8"),
+    readFile(new URL("deploy/001_initial.sql", root), "utf8"),
+  ]);
+
+  for (const component of ["ProjectOverview", "ContactOverview", "TaskBoard", "ActivityMini"]) {
+    assert.match(page, new RegExp(`function ${component}`));
+  }
+  assert.match(page, /onCreateChild/);
+  assert.match(page, /name="contactIds"/);
+  assert.match(page, /name="tags"/);
+  assert.match(page, /draggable/);
+  assert.match(page, /\/api\/schedules\/\$\{item\.id\}\/move/);
+  assert.match(api, /ensureColumn\("projects", "parent_id"/);
+  assert.match(api, /function setProjectContacts/);
+  assert.match(api, /CREATE TABLE IF NOT EXISTS tasks/);
+  assert.match(api, /CREATE TABLE IF NOT EXISTS activity_logs/);
+  assert.match(api, /deleted_group/);
+  assert.match(api, /moveScheduleMatch/);
+  assert.match(schema, /parent_id INTEGER REFERENCES projects/);
+  assert.match(schema, /CREATE TABLE IF NOT EXISTS tasks/);
+  assert.match(schema, /CREATE TABLE IF NOT EXISTS activity_logs/);
 });
 
 test("list records and calendar events provide rich hover details", async () => {
