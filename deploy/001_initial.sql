@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS projects (
   color TEXT NOT NULL DEFAULT '#ff735f',
   created_by INTEGER REFERENCES users(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS contacts (
@@ -37,7 +38,8 @@ CREATE TABLE IF NOT EXISTS contacts (
   notes TEXT,
   created_by INTEGER REFERENCES users(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS project_contacts (
@@ -58,7 +60,8 @@ CREATE TABLE IF NOT EXISTS schedules (
   color TEXT NOT NULL DEFAULT '#ff735f',
   created_by INTEGER REFERENCES users(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  deleted_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS schedule_projects (
@@ -81,6 +84,7 @@ CREATE TABLE IF NOT EXISTS attachments (
   content_type TEXT,
   size_bytes INTEGER NOT NULL DEFAULT 0,
   cos_etag TEXT,
+  deleted_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -97,3 +101,7 @@ CREATE INDEX IF NOT EXISTS idx_projects_region ON projects(region);
 CREATE INDEX IF NOT EXISTS idx_contacts_region ON contacts(region);
 CREATE INDEX IF NOT EXISTS idx_schedules_starts_at ON schedules(starts_at);
 CREATE INDEX IF NOT EXISTS idx_attachments_schedule_id ON attachments(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_projects_deleted_at ON projects(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_contacts_deleted_at ON contacts(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_schedules_deleted_at ON schedules(deleted_at) WHERE deleted_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_attachments_deleted_at ON attachments(deleted_at) WHERE deleted_at IS NOT NULL;

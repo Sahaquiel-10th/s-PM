@@ -12,6 +12,22 @@ mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
 const db = new DatabaseSync(join(dataDir, "s-pm.sqlite"));
 db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
+
+function ensureColumn(table, column, definition) {
+  const exists = db.prepare(`PRAGMA table_info(${table})`).all().some(entry => entry.name === column);
+  if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+for (const table of ["projects", "contacts", "schedules", "attachments"]) {
+  ensureColumn(table, "deleted_at", "TEXT");
+}
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_projects_deleted_at ON projects(deleted_at) WHERE deleted_at IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_contacts_deleted_at ON contacts(deleted_at) WHERE deleted_at IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_schedules_deleted_at ON schedules(deleted_at) WHERE deleted_at IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS idx_attachments_deleted_at ON attachments(deleted_at) WHERE deleted_at IS NOT NULL;
+  PRAGMA optimize;
+`);
 db.exec(`CREATE TABLE IF NOT EXISTS user_settings (
   user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   schedule_reminders INTEGER NOT NULL DEFAULT 1,
@@ -96,26 +112,43 @@ function verifyPassword(password, stored) {
 function projectRows() {
   return db.prepare(`SELECT id, name, client_name AS client, status, region, start_date AS startDate,
     end_date AS endDate, notes, color, COALESCE(substr(start_date, 6), '') || CASE WHEN end_date IS NULL THEN '' ELSE '—' || substr(end_date, 6) END AS date
-    FROM projects ORDER BY created_at DESC`).all().map(row => ({ ...row, id: String(row.id) }));
+    FROM projects WHERE deleted_at IS NULL ORDER BY created_at DESC`).all().map(row => ({ ...row, id: String(row.id) }));
 }
 
 function contactRows() {
   return db.prepare(`SELECT c.id, c.name, c.company, c.role, c.phone, c.email, c.region, c.notes,
-    COUNT(pc.project_id) AS count FROM contacts c LEFT JOIN project_contacts pc ON pc.contact_id = c.id
-    GROUP BY c.id ORDER BY count DESC, c.created_at DESC`).all().map((row, index) => ({ ...row, id: String(row.id), tone: tones[index % tones.length] }));
+    COUNT(CASE WHEN p.deleted_at IS NULL THEN pc.project_id END) AS count FROM contacts c
+    LEFT JOIN project_contacts pc ON pc.contact_id = c.id
+    LEFT JOIN projects p ON p.id = pc.project_id
+    WHERE c.deleted_at IS NULL GROUP BY c.id ORDER BY count DESC, c.created_at DESC`).all().map((row, index) => ({ ...row, id: String(row.id), tone: tones[index % tones.length] }));
 }
 
 function scheduleRows() {
   const rows = db.prepare(`SELECT s.id, s.title, s.description, s.location AS place, s.starts_at AS startsAt, s.ends_at AS endsAt,
     sp.project_id AS project, sc.contact_id AS person FROM schedules s
     LEFT JOIN schedule_projects sp ON sp.schedule_id = s.id
-    LEFT JOIN schedule_contacts sc ON sc.schedule_id = s.id ORDER BY s.starts_at`).all();
-  const attachmentQuery = db.prepare("SELECT id, original_name AS name, content_type AS type, size_bytes AS size FROM attachments WHERE schedule_id = ? ORDER BY created_at");
+    LEFT JOIN schedule_contacts sc ON sc.schedule_id = s.id
+    WHERE s.deleted_at IS NULL ORDER BY s.starts_at`).all();
+  const attachmentQuery = db.prepare("SELECT id, original_name AS name, content_type AS type, size_bytes AS size FROM attachments WHERE schedule_id = ? AND deleted_at IS NULL ORDER BY created_at");
   return rows.map((row, index) => {
       const start = new Date(String(row.startsAt));
       const end = new Date(String(row.endsAt));
       return { ...row, id: Number(row.id), project: row.project == null ? null : String(row.project), person: row.person == null ? null : String(row.person), day: start.getDate(), time: start.toTimeString().slice(0, 5), duration: Math.max(.5, (end.getTime() - start.getTime()) / 3600000), color: colors[index % colors.length], attachments: attachmentQuery.all(row.id) };
     });
+}
+
+function trashRows() {
+  return [
+    ...db.prepare(`SELECT id, 'project' AS type, '项目' AS label, name, COALESCE(client_name, status, '') AS summary, deleted_at AS deletedAt
+      FROM projects WHERE deleted_at IS NOT NULL`).all(),
+    ...db.prepare(`SELECT id, 'contact' AS type, '人员' AS label, name, COALESCE(company, role, '') AS summary, deleted_at AS deletedAt
+      FROM contacts WHERE deleted_at IS NOT NULL`).all(),
+    ...db.prepare(`SELECT id, 'schedule' AS type, '日程' AS label, title AS name, COALESCE(location, starts_at, '') AS summary, deleted_at AS deletedAt
+      FROM schedules WHERE deleted_at IS NOT NULL`).all(),
+    ...db.prepare(`SELECT a.id, 'attachment' AS type, '附件' AS label, a.original_name AS name,
+      COALESCE(s.title, '所属日程不存在') AS summary, a.deleted_at AS deletedAt
+      FROM attachments a LEFT JOIN schedules s ON s.id = a.schedule_id WHERE a.deleted_at IS NOT NULL`).all(),
+  ].map(row => ({ ...row, id: String(row.id) })).sort((a, b) => String(b.deletedAt).localeCompare(String(a.deletedAt)));
 }
 
 function settingsFor(userId) {
@@ -129,7 +162,7 @@ function bootstrap(userId) {
   const people = contactRows();
   const events = scheduleRows();
   const profile = db.prepare("SELECT username, display_name AS displayName, email FROM users WHERE id = ?").get(userId);
-  return { projects, people, events, profile, preferences: settingsFor(userId), storage: { provider: "腾讯云 COS", configured: cosConfigured, bucket: cosConfigured ? cosConfig.bucket : null, region: cosConfigured ? cosConfig.region : null } };
+  return { projects, people, events, trash: trashRows(), profile, preferences: settingsFor(userId), storage: { provider: "腾讯云 COS", configured: cosConfigured, bucket: cosConfigured ? cosConfig.bucket : null, region: cosConfigured ? cosConfig.region : null } };
 }
 
 function required(value, label) {
@@ -167,6 +200,16 @@ const server = createServer(async (req, res) => {
     if (!user) return send(res, 401, { error: "请先登录" });
     if (req.method === "GET" && url.pathname === "/api/session") return send(res, 200, { user });
     if (req.method === "GET" && url.pathname === "/api/bootstrap") return send(res, 200, bootstrap(user.id));
+    if (req.method === "GET" && url.pathname === "/api/trash") return send(res, 200, { items: trashRows() });
+
+    const restoreMatch = url.pathname.match(/^\/api\/trash\/(project|contact|schedule|attachment)\/(\d+)\/restore$/);
+    if (restoreMatch && req.method === "POST") {
+      const tables = { project: "projects", contact: "contacts", schedule: "schedules", attachment: "attachments" };
+      const table = tables[restoreMatch[1]];
+      const result = db.prepare(`UPDATE ${table} SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL`).run(Number(restoreMatch[2]));
+      if (!result.changes) return send(res, 404, { error: "回收站中未找到该记录" });
+      return send(res, 200, { ok: true });
+    }
 
     if (req.method === "PUT" && url.pathname === "/api/profile") {
       const body = await readJson(req);
@@ -216,13 +259,13 @@ const server = createServer(async (req, res) => {
     const projectMatch = url.pathname.match(/^\/api\/projects\/(\d+)$/);
     if (projectMatch && req.method === "PUT") {
       const body = await readJson(req);
-      const result = db.prepare(`UPDATE projects SET name = ?, client_name = ?, status = ?, region = ?, start_date = ?, end_date = ?, notes = ?, updated_at = datetime('now') WHERE id = ?`)
+      const result = db.prepare(`UPDATE projects SET name = ?, client_name = ?, status = ?, region = ?, start_date = ?, end_date = ?, notes = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`)
         .run(required(body.name, "项目名称"), body.client || null, body.status || "提案中", body.region || null, body.startDate || null, body.endDate || null, body.notes || null, Number(projectMatch[1]));
       if (!result.changes) return send(res, 404, { error: "项目不存在" });
       return send(res, 200, { id: projectMatch[1] });
     }
     if (projectMatch && req.method === "DELETE") {
-      const result = db.prepare("DELETE FROM projects WHERE id = ?").run(Number(projectMatch[1]));
+      const result = db.prepare("UPDATE projects SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL").run(Number(projectMatch[1]));
       if (!result.changes) return send(res, 404, { error: "项目不存在" });
       return send(res, 200, { ok: true });
     }
@@ -237,13 +280,13 @@ const server = createServer(async (req, res) => {
     const contactMatch = url.pathname.match(/^\/api\/contacts\/(\d+)$/);
     if (contactMatch && req.method === "PUT") {
       const body = await readJson(req);
-      const result = db.prepare(`UPDATE contacts SET name = ?, company = ?, role = ?, phone = ?, email = ?, region = ?, notes = ?, updated_at = datetime('now') WHERE id = ?`)
+      const result = db.prepare(`UPDATE contacts SET name = ?, company = ?, role = ?, phone = ?, email = ?, region = ?, notes = ?, updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL`)
         .run(required(body.name, "姓名"), body.company || null, body.role || null, body.phone || null, body.email || null, body.region || null, body.notes || null, Number(contactMatch[1]));
       if (!result.changes) return send(res, 404, { error: "人员不存在" });
       return send(res, 200, { id: contactMatch[1] });
     }
     if (contactMatch && req.method === "DELETE") {
-      const result = db.prepare("DELETE FROM contacts WHERE id = ?").run(Number(contactMatch[1]));
+      const result = db.prepare("UPDATE contacts SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL").run(Number(contactMatch[1]));
       if (!result.changes) return send(res, 404, { error: "人员不存在" });
       return send(res, 200, { ok: true });
     }
@@ -268,7 +311,7 @@ const server = createServer(async (req, res) => {
     if (scheduleMatch && req.method === "PUT") {
       const scheduleId = Number(scheduleMatch[1]);
       const body = await readJson(req);
-      if (!db.prepare("SELECT id FROM schedules WHERE id = ?").get(scheduleId)) return send(res, 404, { error: "日程不存在" });
+      if (!db.prepare("SELECT id FROM schedules WHERE id = ? AND deleted_at IS NULL").get(scheduleId)) return send(res, 404, { error: "日程不存在" });
       db.exec("BEGIN IMMEDIATE");
       try {
         db.prepare(`UPDATE schedules SET title = ?, description = ?, location = ?, starts_at = ?, ends_at = ?, updated_at = datetime('now') WHERE id = ?`)
@@ -283,13 +326,8 @@ const server = createServer(async (req, res) => {
     }
     if (scheduleMatch && req.method === "DELETE") {
       const scheduleId = Number(scheduleMatch[1]);
-      if (!db.prepare("SELECT id FROM schedules WHERE id = ?").get(scheduleId)) return send(res, 404, { error: "日程不存在" });
-      const attachments = db.prepare("SELECT object_key FROM attachments WHERE schedule_id = ?").all(scheduleId);
-      if (attachments.length && !cos) return send(res, 503, { error: "腾讯 COS 尚未完成配置，无法删除日程附件" });
-      for (const attachment of attachments) {
-        await cos.deleteObject({ Bucket: cosConfig.bucket, Region: cosConfig.region, Key: attachment.object_key });
-      }
-      db.prepare("DELETE FROM schedules WHERE id = ?").run(scheduleId);
+      const result = db.prepare("UPDATE schedules SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND deleted_at IS NULL").run(scheduleId);
+      if (!result.changes) return send(res, 404, { error: "日程不存在" });
       return send(res, 200, { ok: true });
     }
 
@@ -297,7 +335,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && uploadMatch) {
       if (!cos) return send(res, 503, { error: "腾讯 COS 尚未完成配置" });
       const scheduleId = Number(uploadMatch[1]);
-      if (!db.prepare("SELECT id FROM schedules WHERE id = ?").get(scheduleId)) return send(res, 404, { error: "日程不存在" });
+      if (!db.prepare("SELECT id FROM schedules WHERE id = ? AND deleted_at IS NULL").get(scheduleId)) return send(res, 404, { error: "日程不存在" });
       const originalName = required(url.searchParams.get("name"), "文件名").slice(0, 240);
       const contentLength = Number(req.headers["content-length"] || 0);
       if (!contentLength || contentLength > 25 * 1024 * 1024) return send(res, 413, { error: "文件大小需在 25MB 以内" });
@@ -312,7 +350,7 @@ const server = createServer(async (req, res) => {
     const downloadMatch = url.pathname.match(/^\/api\/attachments\/(\d+)\/download$/);
     if (req.method === "GET" && downloadMatch) {
       if (!cos) return send(res, 503, { error: "腾讯 COS 尚未完成配置" });
-      const attachment = db.prepare("SELECT object_key FROM attachments WHERE id = ?").get(Number(downloadMatch[1]));
+      const attachment = db.prepare("SELECT object_key FROM attachments WHERE id = ? AND deleted_at IS NULL").get(Number(downloadMatch[1]));
       if (!attachment) return send(res, 404, { error: "附件不存在" });
       const signedUrl = cos.getObjectUrl({ Bucket: cosConfig.bucket, Region: cosConfig.region, Key: attachment.object_key, Sign: true, Method: "GET", Expires: 300, Protocol: "https:" });
       res.writeHead(302, { location: signedUrl, "cache-control": "no-store" });
@@ -321,11 +359,8 @@ const server = createServer(async (req, res) => {
 
     const attachmentMatch = url.pathname.match(/^\/api\/attachments\/(\d+)$/);
     if (req.method === "DELETE" && attachmentMatch) {
-      if (!cos) return send(res, 503, { error: "腾讯 COS 尚未完成配置" });
-      const attachment = db.prepare("SELECT object_key FROM attachments WHERE id = ?").get(Number(attachmentMatch[1]));
-      if (!attachment) return send(res, 404, { error: "附件不存在" });
-      await cos.deleteObject({ Bucket: cosConfig.bucket, Region: cosConfig.region, Key: attachment.object_key });
-      db.prepare("DELETE FROM attachments WHERE id = ?").run(Number(attachmentMatch[1]));
+      const result = db.prepare("UPDATE attachments SET deleted_at = datetime('now') WHERE id = ? AND deleted_at IS NULL").run(Number(attachmentMatch[1]));
+      if (!result.changes) return send(res, 404, { error: "附件不存在" });
       return send(res, 200, { ok: true });
     }
 

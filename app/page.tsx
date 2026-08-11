@@ -5,10 +5,11 @@ import { createPortal } from "react-dom";
 
 type Section = "dashboard" | "projects" | "people" | "settings";
 type CalendarMode = "日" | "周" | "月" | "年";
-type SettingsTab = "profile" | "security" | "notifications" | "storage";
+type SettingsTab = "profile" | "security" | "notifications" | "storage" | "trash";
 type Profile = { displayName: string; username: string; email?: string | null };
 type Preferences = { scheduleReminders: boolean; projectUpdates: boolean; weeklyDigest: boolean };
 type StorageInfo = { provider: string; configured: boolean; bucket?: string | null; region?: string | null };
+type TrashItem = { id: string; type: "project" | "contact" | "schedule" | "attachment"; label: string; name: string; summary?: string | null; deletedAt: string };
 
 const projects = [
   { id: "p1", name: "湖畔新生·品牌升级", client: "美湖文旅", status: "进行中", color: "#ff6b57", region: "杭州", date: "08.02—11.18" },
@@ -56,6 +57,7 @@ export default function Home() {
   const [profile, setProfile] = useState<Profile>({ displayName: "汪诺", username: "汪诺", email: "" });
   const [preferences, setPreferences] = useState<Preferences>({ scheduleReminders: true, projectUpdates: true, weeklyDigest: true });
   const [storage, setStorage] = useState<StorageInfo>({ provider: "腾讯云 COS", configured: false });
+  const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("profile");
   const [calendarDate, setCalendarDate] = useState(() => new Date());
 
@@ -84,6 +86,7 @@ export default function Home() {
     setProjectItems(data.projects || []);
     setPeopleItems(data.people || []);
     setEventItems(data.events || []);
+    setTrashItems(data.trash || []);
     if (data.profile) setProfile(data.profile);
     if (data.preferences) setPreferences(data.preferences);
     if (data.storage) setStorage(data.storage);
@@ -142,7 +145,7 @@ export default function Home() {
 
   async function deleteRecord(type: "project" | "person" | "event", item: any) {
     const label = type === "project" ? "项目" : type === "person" ? "人员" : "日程";
-    if (!window.confirm(`确定删除“${item.name || item.title}”吗？${type === "event" && item.attachments?.length ? " 其附件也会一并删除。" : ""}`)) return;
+    if (!window.confirm(`确定将“${item.name || item.title}”移入回收站吗？之后可以随时恢复。`)) return;
     const endpoint = type === "project" ? "projects" : type === "person" ? "contacts" : "schedules";
     const response = await fetch(`/api/${endpoint}/${item.id}`, { method: "DELETE", credentials: "include" });
     const data = await response.json().catch(() => ({}));
@@ -150,7 +153,15 @@ export default function Home() {
     if (type === "project" && selectedProject === item.id) setSelectedProject(null);
     if (type === "person" && selectedPerson === item.id) setSelectedPerson(null);
     setModal(null); setEditingItem(null);
-    await loadData(); notify(`${label}已删除`);
+    await loadData(); notify(`${label}已移入回收站`);
+  }
+
+  async function restoreRecord(item: TrashItem) {
+    const response = await fetch(`/api/trash/${item.type}/${item.id}/restore`, { method: "POST", credentials: "include" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return notify(data.error || "恢复失败");
+    await loadData();
+    notify(`${item.label}“${item.name}”已恢复`);
   }
 
   useEffect(() => {
@@ -234,7 +245,7 @@ export default function Home() {
               onDate={setCalendarDate}
             />
           )}
-          {section === "settings" && <Settings tab={settingsTab} onTab={setSettingsTab} profile={profile} preferences={preferences} storage={storage} counts={{ projects: projectItems.length, people: peopleItems.length, events: eventItems.length }} onSaved={async message => { await loadData(); notify(message); }} />}
+          {section === "settings" && <Settings tab={settingsTab} onTab={setSettingsTab} profile={profile} preferences={preferences} storage={storage} trash={trashItems} counts={{ projects: projectItems.length, people: peopleItems.length, events: eventItems.length }} onRestore={restoreRecord} onSaved={async message => { await loadData(); notify(message); }} />}
         </div>
       </section>
 
@@ -410,7 +421,7 @@ function DayView({ events: visible, date, onEdit }: { events: typeof events; dat
 function MonthView({ events: visible, date, onEdit }: { events: typeof events; date: Date; onEdit: (item: any) => void }) { const first = new Date(date.getFullYear(), date.getMonth(), 1); const start = mondayOf(first); const cells = Array.from({ length: 42 }, (_, i) => addDate(start, i, "day")); const today = dateKey(new Date()); return <div className="month-view"><div className="month-weekdays">{["一", "二", "三", "四", "五", "六", "日"].map(d => <span key={d}>周{d}</span>)}</div><div className="month-grid">{cells.map(day => <div key={dateKey(day)} className={`${dateKey(day) === today ? "today-cell" : ""} ${day.getMonth() !== date.getMonth() ? "muted" : ""}`}><strong>{day.getDate()}</strong>{visible.filter((e: any) => dateKey(e.startsAt) === dateKey(day)).map((e: any) => <button className={`month-event ${e.color}`} key={e.id} onClick={() => onEdit(e)}>{e.title}<EventHover event={e} /></button>)}</div>)}</div></div>; }
 function YearView({ events: visible, date }: { events: typeof events; date: Date }) { const today = new Date(); return <div className="year-view">{Array.from({ length: 12 }, (_, month) => { const first = new Date(date.getFullYear(), month, 1); const start = mondayOf(first); const cells = Array.from({ length: 42 }, (_, i) => addDate(start, i, "day")); return <div className={today.getFullYear() === date.getFullYear() && today.getMonth() === month ? "current-month" : ""} key={month}><h3>{month + 1} 月</h3><div className="mini-week">{["一", "二", "三", "四", "五", "六", "日"].map(d => <span key={d}>{d}</span>)}</div><div className="mini-days">{cells.map(day => <i key={dateKey(day)} className={day.getMonth() === month && visible.some((e: any) => dateKey(e.startsAt) === dateKey(day)) ? "has-event" : dateKey(day) === dateKey(today) ? "today" : ""}>{day.getMonth() === month ? day.getDate() : ""}</i>)}</div></div>; })}</div>; }
 
-function Settings({ tab, onTab, profile, preferences, storage, counts, onSaved }: { tab: SettingsTab; onTab: (tab: SettingsTab) => void; profile: Profile; preferences: Preferences; storage: StorageInfo; counts: { projects: number; people: number; events: number }; onSaved: (message: string) => Promise<void> }) {
+function Settings({ tab, onTab, profile, preferences, storage, trash, counts, onRestore, onSaved }: { tab: SettingsTab; onTab: (tab: SettingsTab) => void; profile: Profile; preferences: Preferences; storage: StorageInfo; trash: TrashItem[]; counts: { projects: number; people: number; events: number }; onRestore: (item: TrashItem) => Promise<void>; onSaved: (message: string) => Promise<void> }) {
   const [prefs, setPrefs] = useState(preferences);
   useEffect(() => setPrefs(preferences), [preferences]);
   const submitJson = async (url: string, body: unknown) => {
@@ -422,12 +433,13 @@ function Settings({ tab, onTab, profile, preferences, storage, counts, onSaved }
   const savePassword = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const data = Object.fromEntries(new FormData(event.currentTarget)); if (data.newPassword !== data.confirmPassword) return onSaved("两次输入的新密码不一致"); try { await submitJson("/api/password", data); event.currentTarget.reset(); await onSaved("密码已更新"); } catch (error) { await onSaved(error instanceof Error ? error.message : "更新失败"); } };
   const savePreferences = async () => { try { await submitJson("/api/preferences", prefs); await onSaved("通知设置已保存"); } catch (error) { await onSaved(error instanceof Error ? error.message : "保存失败"); } };
   const exportData = async () => { const response = await fetch("/api/export", { credentials: "include" }); if (!response.ok) return onSaved("导出失败"); const blob = await response.blob(); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `s-pm-export-${new Date().toISOString().slice(0, 10)}.json`; link.click(); URL.revokeObjectURL(link.href); await onSaved("数据导出已开始"); };
-  const nav: Array<[SettingsTab, string]> = [["profile", "个人信息"], ["security", "账号与安全"], ["notifications", "通知设置"], ["storage", "数据与存储"]];
-  return <div className="settings-page"><div className="calendar-heading"><div><p>工作台设置</p><h1>设置</h1><span>管理个人信息、账号与数据</span></div></div><div className="settings-layout"><aside>{nav.map(([id, label]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => onTab(id)}>{label}</button>)}</aside>
+  const nav: Array<[SettingsTab, string]> = [["profile", "个人信息"], ["security", "账号与安全"], ["notifications", "通知设置"], ["storage", "数据与存储"], ["trash", "回收站"]];
+  return <div className="settings-page"><div className="calendar-heading"><div><p>工作台设置</p><h1>设置</h1><span>管理个人信息、账号与数据</span></div></div><div className="settings-layout"><aside>{nav.map(([id, label]) => <button key={id} className={`${tab === id ? "active" : ""} ${id === "trash" ? "trash-nav" : ""}`} onClick={() => onTab(id)}>{label}{id === "trash" && trash.length > 0 ? <small>{trash.length}</small> : null}</button>)}</aside>
     {tab === "profile" && <form className="settings-card" onSubmit={saveProfile}><div className="settings-avatar">{profile.displayName.slice(-2).toUpperCase()}</div><div><h3>个人信息</h3><p>这些信息会显示在你的个人工作台中。</p></div><label>姓名<input name="displayName" defaultValue={profile.displayName} required /></label><label>登录账号<input name="username" defaultValue={profile.username} required /></label><label>邮箱<input name="email" type="email" defaultValue={profile.email || ""} placeholder="可选" /></label><button className="primary" type="submit">保存修改</button></form>}
     {tab === "security" && <form className="settings-card settings-form" onSubmit={savePassword}><div className="settings-icon">⌁</div><div><h3>账号与安全</h3><p>修改登录密码。新密码至少需要 8 位。</p></div><label>当前密码<input name="currentPassword" type="password" required autoComplete="current-password" /></label><label>新密码<input name="newPassword" type="password" minLength={8} required autoComplete="new-password" /></label><label>确认新密码<input name="confirmPassword" type="password" minLength={8} required autoComplete="new-password" /></label><button className="primary" type="submit">更新密码</button></form>}
     {tab === "notifications" && <section className="settings-card settings-form"><div className="settings-icon">◌</div><div><h3>通知设置</h3><p>选择希望在工作台中看到的提醒。</p></div><Toggle label="日程开始提醒" note="日程临近时在工作台显示提醒" checked={prefs.scheduleReminders} onChange={value => setPrefs({ ...prefs, scheduleReminders: value })} /><Toggle label="项目状态变化" note="项目状态更新时显示通知" checked={prefs.projectUpdates} onChange={value => setPrefs({ ...prefs, projectUpdates: value })} /><Toggle label="每周工作摘要" note="每周汇总项目、人员和日程" checked={prefs.weeklyDigest} onChange={value => setPrefs({ ...prefs, weeklyDigest: value })} /><button className="primary" onClick={savePreferences}>保存设置</button></section>}
     {tab === "storage" && <section className="settings-card settings-form"><div className="settings-icon">▣</div><div><h3>数据与存储</h3><p>业务数据保存在独立 SQLite 数据库，附件保存在腾讯 COS。</p></div><div className="storage-status"><span className={storage.configured ? "online" : "offline"}></span><div><strong>{storage.provider} · {storage.configured ? "已连接" : "待配置"}</strong><small>{storage.configured ? `${storage.bucket} · ${storage.region}` : "完成专用密钥配置后即可上传附件"}</small></div></div><div className="storage-counts"><span><strong>{counts.projects}</strong>项目</span><span><strong>{counts.people}</strong>人员</span><span><strong>{counts.events}</strong>日程</span></div><button className="primary" onClick={exportData}>导出全部数据</button></section>}
+    {tab === "trash" && <section className="settings-card trash-card"><div className="settings-icon">⌑</div><div><h3>回收站</h3><p>删除的项目、人员、日程和附件会保留在这里，需要时可随时恢复。</p></div><div className="trash-list">{trash.length ? trash.map(item => <article key={`${item.type}-${item.id}`}><span className={`trash-type ${item.type}`}>{item.label}</span><div><strong>{item.name}</strong><small>{item.summary || "无补充信息"} · {new Date(`${item.deletedAt}Z`).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })}</small></div><button onClick={() => onRestore(item)}>恢复</button></article>) : <div className="trash-empty"><span>✓</span><strong>回收站是空的</strong><small>删除的内容会出现在这里</small></div>}</div></section>}
   </div></div>;
 }
 
@@ -437,12 +449,12 @@ function Modal({ type, item, onClose, onSave, onDelete, onAttachmentDeleted, pro
   const fileRef = useRef<HTMLInputElement>(null); const [files, setFiles] = useState<File[]>([]); const [attachments, setAttachments] = useState<any[]>(item?.attachments || []);
   const label = type === "project" ? "项目" : type === "person" ? "人员" : "日程";
   const title = `${item ? "编辑" : "新建"}${label}`;
-  const removeAttachment = async (attachment: any) => { if (!window.confirm(`确定删除附件“${attachment.name}”吗？`)) return; const response = await fetch(`/api/attachments/${attachment.id}`, { method: "DELETE", credentials: "include" }); if (response.ok) { setAttachments(current => current.filter(entry => entry.id !== attachment.id)); await onAttachmentDeleted(); } else window.alert((await response.json().catch(() => ({}))).error || "附件删除失败"); };
+  const removeAttachment = async (attachment: any) => { if (!window.confirm(`确定将附件“${attachment.name}”移入回收站吗？`)) return; const response = await fetch(`/api/attachments/${attachment.id}`, { method: "DELETE", credentials: "include" }); if (response.ok) { setAttachments(current => current.filter(entry => entry.id !== attachment.id)); await onAttachmentDeleted(); } else window.alert((await response.json().catch(() => ({}))).error || "附件删除失败"); };
   return <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}><form className="modal" onSubmit={e => onSave(e, files)}><div className="modal-head"><div><span>{type === "event" ? "CALENDAR" : "NEW RECORD"}</span><h2>{title}</h2></div><button type="button" onClick={onClose}>×</button></div>
     {type === "project" && <><label>项目名称<input name="name" required defaultValue={item?.name || ""} placeholder="例如：秋季新品发布" /></label><div className="form-row"><label>客户 / 合作方<input name="client" defaultValue={item?.client || ""} placeholder="输入合作方" /></label><label>项目状态<select name="status" defaultValue={item?.status || "提案中"}><option>提案中</option><option>进行中</option><option>已完成</option><option>已搁置</option></select></label></div><div className="form-row"><label>开始日期<input name="startDate" type="date" defaultValue={item?.startDate || ""} /></label><label>结束日期<input name="endDate" type="date" defaultValue={item?.endDate || ""} /></label></div><label>所在地区<input name="region" defaultValue={item?.region || ""} placeholder="上海" /></label><label>项目备注<textarea name="notes" defaultValue={item?.notes || ""} placeholder="记录项目目标和重要信息…"></textarea></label></>}
     {type === "person" && <><div className="form-row"><label>姓名<input name="name" required defaultValue={item?.name || ""} placeholder="联系人姓名" /></label><label>职位<input name="role" defaultValue={item?.role || ""} placeholder="品牌总监" /></label></div><label>公司 / 机构<input name="company" defaultValue={item?.company || ""} placeholder="所在公司" /></label><div className="form-row"><label>手机号<input name="phone" defaultValue={item?.phone || ""} placeholder="138 0000 0000" /></label><label>邮箱<input name="email" type="email" defaultValue={item?.email || ""} placeholder="name@example.com" /></label></div><label>所在地<input name="region" defaultValue={item?.region || ""} placeholder="杭州" /></label><label>备注<textarea name="notes" defaultValue={item?.notes || ""} placeholder="记录彼此的合作偏好…"></textarea></label></>}
     {type === "event" && <><label>日程标题<input name="title" required defaultValue={item?.title || ""} placeholder="例如：项目启动会" /></label><div className="form-row"><label>开始时间<input name="startsAt" type="datetime-local" required defaultValue={item?.startsAt?.slice(0, 16) || ""} /></label><label>结束时间<input name="endsAt" type="datetime-local" required defaultValue={item?.endsAt?.slice(0, 16) || ""} /></label></div><div className="form-row"><label>关联项目<select name="projectId" defaultValue={item?.project || ""}><option value="">请选择</option>{projects.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label><label>关联人员<select name="contactId" defaultValue={item?.person || ""}><option value="">请选择</option>{people.map(p => <option value={p.id} key={p.id}>{p.name}</option>)}</select></label></div><label>地点<input name="location" defaultValue={item?.place || ""} placeholder="会议室或线上链接" /></label><label>备注<textarea name="description" defaultValue={item?.description || ""} placeholder="补充日程说明…"></textarea></label>{attachments.length > 0 && <div className="existing-files"><strong>已有附件</strong>{attachments.map((attachment: any) => <span key={attachment.id}><a href={`/api/attachments/${attachment.id}/download`}>▧ {attachment.name}</a><button type="button" onClick={() => removeAttachment(attachment)}>删除</button></span>)}</div>}<div className="upload-area" onClick={() => fileRef.current?.click()}><input ref={fileRef} type="file" multiple accept="image/*,.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx" onChange={e => setFiles(Array.from(e.target.files || []))} /><span>↑</span><div><strong>{item ? "继续添加文件或图片" : "上传文件或图片"}</strong><small>单个文件不超过 25MB，保存日程时上传至腾讯 COS</small></div></div>{files.length > 0 && <div className="file-list">{files.map(f => <span key={`${f.name}-${f.size}`}>▧ {f.name} · {(f.size / 1024 / 1024).toFixed(1)}MB</span>)}</div>}</>}
-    <div className="modal-actions">{item && <button className="delete-record" type="button" onClick={onDelete}>删除{label}</button>}<span></span><button type="button" onClick={onClose}>取消</button><button className="primary" type="submit">{item ? "保存修改" : `创建${label}`}</button></div></form></div>;
+    <div className="modal-actions">{item && <button className="delete-record" type="button" onClick={onDelete}>移入回收站</button>}<span></span><button type="button" onClick={onClose}>取消</button><button className="primary" type="submit">{item ? "保存修改" : `创建${label}`}</button></div></form></div>;
 }
 
 function SearchOverlay({ query, setQuery, results, onClose, onChoose, onWeek, onOngoing }: any) { return <div className="search-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}><div className="search-box"><div className="search-input"><span>⌕</span><input autoFocus value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索项目、联系人或日程…" /><kbd onClick={onClose}>ESC</kbd></div>{query ? <div className="search-results"><p>搜索结果 · {results.length}</p>{results.length ? results.map((r: any) => <button key={`${r.type}${r.id}`} onClick={() => onChoose(r)}><span>{r.type === "项目" ? "□" : r.type === "联系人" ? "○" : "⌘"}</span><div><strong>{r.name}</strong><small>{r.type === "项目" ? `${r.client || "无合作方"} · ${r.region || "无地区"}` : r.type === "联系人" ? `${r.company || "无公司"} · ${r.role || "无职位"}` : `${r.time} · ${r.place || "未填写地点"}`}</small></div><em>{r.type}</em></button>) : <div className="empty-search">没有找到匹配内容</div>}</div> : <div className="search-suggestions"><p>快速访问</p><button onClick={onWeek}><span>⌘</span>查看本周日程</button><button onClick={onOngoing}><span>□</span>查看进行中项目</button></div>}<div className="search-foot">输入关键词后选择结果　·　ESC 关闭</div></div></div>; }

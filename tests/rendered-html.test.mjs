@@ -22,7 +22,7 @@ test("the application shell renders the 澄序 workspace", async () => {
   assert.doesNotMatch(html, /Your site is taking shape|codex-preview/i);
 });
 
-test("projects, contacts and schedules expose edit and delete flows", async () => {
+test("projects, contacts, schedules and attachments expose edit and recoverable delete flows", async () => {
   const [page, api] = await Promise.all([
     readFile(new URL("app/page.tsx", root), "utf8"),
     readFile(new URL("server/api.mjs", root), "utf8"),
@@ -32,6 +32,8 @@ test("projects, contacts and schedules expose edit and delete flows", async () =
   assert.match(page, /function deleteRecord/);
   assert.match(page, /method: editingItem \? "PUT" : "POST"/);
   assert.match(page, /method: "DELETE"/);
+  assert.match(page, /移入回收站/);
+  assert.match(page, /function restoreRecord/);
   assert.match(page, /const title = `\$\{item \? "编辑" : "新建"\}\$\{label\}`/);
 
   for (const resource of ["projects", "contacts", "schedules"]) {
@@ -44,6 +46,11 @@ test("projects, contacts and schedules expose edit and delete flows", async () =
   assert.match(api, /scheduleMatch && req\.method === "PUT"/);
   assert.match(api, /scheduleMatch && req\.method === "DELETE"/);
   assert.match(api, /req\.method === "DELETE" && attachmentMatch/);
+  assert.match(api, /function trashRows/);
+  assert.match(api, /\/restore/);
+  assert.doesNotMatch(api, /DELETE FROM projects WHERE id/);
+  assert.doesNotMatch(api, /DELETE FROM contacts WHERE id/);
+  assert.doesNotMatch(api, /DELETE FROM schedules WHERE id/);
 });
 
 test("list records and calendar events provide rich hover details", async () => {
